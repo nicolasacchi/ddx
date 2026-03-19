@@ -44,17 +44,44 @@ var servicesListCmd = &cobra.Command{
 			return err
 		}
 
-		params := url.Values{}
-		if servicesQuery != "" {
-			params.Set("filter", servicesQuery)
+		// Auto-paginate to get all services
+		var allItems []json.RawMessage
+		pageSize := 100
+		page := 0
+		for {
+			params := url.Values{}
+			if servicesQuery != "" {
+				params.Set("filter", servicesQuery)
+			}
+			params.Set("page[size]", fmt.Sprintf("%d", pageSize))
+			params.Set("page[number]", fmt.Sprintf("%d", page))
+
+			data, err := c.Get(context.Background(), "api/v2/services/definitions", params)
+			if err != nil {
+				return err
+			}
+
+			items := extractData(data)
+			var batch []json.RawMessage
+			if json.Unmarshal(items, &batch) != nil || len(batch) == 0 {
+				break
+			}
+			allItems = append(allItems, batch...)
+
+			if len(batch) < pageSize {
+				break
+			}
+			page++
+			if page > 20 { // safety limit
+				break
+			}
 		}
 
-		data, err := c.Get(context.Background(), "api/v2/services/definitions", params)
-		if err != nil {
-			return err
+		if allItems == nil {
+			allItems = []json.RawMessage{}
 		}
-
-		return printData("", extractData(data))
+		out, _ := json.Marshal(allItems)
+		return printData("", out)
 	},
 }
 

@@ -9,11 +9,13 @@ import (
 
 // ParsedQuery represents a parsed SQL SELECT statement.
 type ParsedQuery struct {
-	Columns   []Column // SELECT columns
-	Filter    string   // WHERE → Datadog filter query
-	GroupBy   []string // GROUP BY fields
-	Limit     int      // LIMIT value (0 = use default)
-	SortOrder string   // "desc" or "asc" (from ORDER BY)
+	Columns      []Column // SELECT columns
+	Filter       string   // WHERE → Datadog filter query
+	GroupBy      []string // GROUP BY fields
+	Limit        int      // LIMIT value (0 = use default)
+	SortOrder    string   // "desc" or "asc" (from ORDER BY)
+	HavingOp     string   // HAVING operator: ">", ">=", "<", "<=", "="
+	HavingValue  float64  // HAVING threshold value
 }
 
 // Column represents a SELECT column — either a plain field or an aggregate.
@@ -32,6 +34,17 @@ func (q *ParsedQuery) HasAggregate() *Column {
 		}
 	}
 	return nil
+}
+
+// Aggregates returns all aggregate columns.
+func (q *ParsedQuery) Aggregates() []Column {
+	var aggs []Column
+	for _, c := range q.Columns {
+		if c.Aggregate != "" {
+			aggs = append(aggs, c)
+		}
+	}
+	return aggs
 }
 
 // PlainFields returns non-aggregate column field names.
@@ -253,8 +266,6 @@ func (p *parser) parse() (*ParsedQuery, error) {
 			switch upper {
 			case "JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "CROSS":
 				return nil, fmt.Errorf("JOIN is not supported — use Datadog MCP analyze_datadog_logs for complex SQL")
-			case "HAVING":
-				return nil, fmt.Errorf("HAVING is not supported — use Datadog MCP analyze_datadog_logs for complex SQL")
 			case "UNION":
 				return nil, fmt.Errorf("UNION is not supported — use Datadog MCP analyze_datadog_logs for complex SQL")
 			case "WITH":
@@ -301,6 +312,27 @@ func (p *parser) parse() (*ParsedQuery, error) {
 			return nil, err
 		}
 		q.GroupBy = groupBy
+	}
+
+	// HAVING — e.g., HAVING COUNT(*) > 10
+	if p.isWord("HAVING") {
+		p.next() // HAVING
+		// Skip the aggregate expression (COUNT(*), SUM(@x), etc.)
+		for {
+			t := p.peek()
+			if t.kind == tkOp || t.kind == tkEOF || p.isWord("ORDER") || p.isWord("LIMIT") {
+				break
+			}
+			p.next()
+		}
+		// Read operator and value
+		if p.peek().kind == tkOp {
+			q.HavingOp = p.next().val
+			if p.peek().kind == tkNumber {
+				v, _ := strconv.ParseFloat(p.next().val, 64)
+				q.HavingValue = v
+			}
+		}
 	}
 
 	// ORDER BY

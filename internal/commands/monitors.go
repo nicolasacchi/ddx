@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"strconv"
 
@@ -23,6 +24,7 @@ func init() {
 	monitorsCmd.AddCommand(monitorsSearchCmd)
 	monitorsCmd.AddCommand(monitorsMuteCmd)
 	monitorsCmd.AddCommand(monitorsUnmuteCmd)
+	monitorsCmd.AddCommand(monitorsDeleteCmd)
 
 	monitorsListCmd.Flags().StringVar(&monitorsTags, "tags", "", "Filter by tags (e.g., env:production)")
 	monitorsListCmd.Flags().StringVar(&monitorsStatus, "status", "", "Filter by status (alert, warn, ok, no_data)")
@@ -157,6 +159,25 @@ var monitorsUnmuteCmd = &cobra.Command{
 			return err
 		}
 		return printData("", data)
+	},
+}
+
+var monitorsDeleteCmd = &cobra.Command{
+	Use:   "delete <id>",
+	Short: "Delete a monitor",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, err := getClient(cmd)
+		if err != nil {
+			return err
+		}
+		if err := c.Delete(context.Background(), "api/v1/monitor/"+args[0]); err != nil {
+			return err
+		}
+		if !quietFlag {
+			fmt.Fprintf(cmd.OutOrStdout(), "Monitor %s deleted\n", args[0])
+		}
+		return nil
 	},
 }
 

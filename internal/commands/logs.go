@@ -4,18 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 )
 
 var (
-	logsQuery      string
-	logsSort       string
-	logsStorage    string
-	logsCompute    string
-	logsGroupBy    string
-	logsExtraField string
+	logsQuery       string
+	logsSort        string
+	logsStorage     string
+	logsCompute     string
+	logsGroupBy     string
+	logsExtraField  string
+	logsPatterns    bool
+	logsExtraFields string
 )
 
 func init() {
@@ -26,6 +29,8 @@ func init() {
 	logsSearchCmd.Flags().StringVar(&logsQuery, "query", "*", "Datadog search query")
 	logsSearchCmd.Flags().StringVar(&logsSort, "sort", "-timestamp", "Sort order: timestamp or -timestamp")
 	logsSearchCmd.Flags().StringVar(&logsStorage, "storage", "", "Storage tier: indexes, flex, online-archives")
+	logsSearchCmd.Flags().BoolVar(&logsPatterns, "patterns", false, "Return log patterns (clusters) instead of raw logs")
+	logsSearchCmd.Flags().StringVar(&logsExtraFields, "extra-fields", "", "Comma-separated field patterns to discover (e.g., '*', 'http*')")
 
 	logsAggregateCmd.Flags().StringVar(&logsQuery, "query", "*", "Datadog search query")
 	logsAggregateCmd.Flags().StringVar(&logsCompute, "compute", "count", "Aggregation: count, avg(@field), sum(@field), min(@field), max(@field)")
@@ -77,9 +82,30 @@ Examples:
 			body["filter"].(map[string]any)["storage_tier"] = logsStorage
 		}
 
+		// Log patterns: return clusters instead of raw logs
+		if logsPatterns {
+			body["options"] = map[string]any{"use_log_patterns": true}
+		}
+
+		// Extra fields: discover custom log attributes
+		if logsExtraFields != "" {
+			fields := splitComma(logsExtraFields)
+			if opts, ok := body["options"].(map[string]any); ok {
+				opts["extra_fields"] = fields
+			} else {
+				body["options"] = map[string]any{"extra_fields": fields}
+			}
+		}
+
 		data, err := c.Post(context.Background(), "api/v2/logs/events/search", body)
 		if err != nil {
 			return err
+		}
+
+		// Show explorer URL in verbose mode
+		if verboseFlag {
+			explorerURL := buildExplorerURL("logs", logsQuery, from, to)
+			fmt.Fprintln(cmd.ErrOrStderr(), "Explorer:", explorerURL)
 		}
 
 		// Extract the logs array from response
@@ -163,6 +189,17 @@ func indexOf(s string, c byte) int {
 		}
 	}
 	return -1
+}
+
+func splitComma(s string) []string {
+	var result []string
+	for _, part := range strings.Split(s, ",") {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }
 
 // extractData unwraps {"data": [...]} from Datadog v2 API responses.

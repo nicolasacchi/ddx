@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/nicolasacchi/ddx/internal/sqlparse"
@@ -17,14 +18,15 @@ var logsSQLCmd = &cobra.Command{
 	Short: "Query logs with SQL syntax",
 	Long: `Run SQL queries against logs. Translates SQL to the Datadog aggregate API.
 
-Supported: SELECT with COUNT/AVG/SUM/MIN/MAX, WHERE, GROUP BY, ORDER BY, LIMIT.
-Not supported: JOIN, HAVING, subqueries, DATE_TRUNC, window functions.
+Supported: SELECT with COUNT/AVG/SUM/MIN/MAX (multiple allowed), WHERE, GROUP BY,
+           HAVING, ORDER BY, LIMIT, IN.
+Not supported: JOIN, subqueries, DATE_TRUNC, window functions.
 
 Examples:
   ddx logs sql "SELECT COUNT(*) FROM logs WHERE status = 'error'" --from 1h
   ddx logs sql "SELECT service, COUNT(*) FROM logs WHERE status = 'error' GROUP BY service LIMIT 10" --from 1h
-  ddx logs sql "SELECT @http.status_code, AVG(@duration) FROM logs GROUP BY @http.status_code" --from 4h
-  ddx logs sql "SELECT service, COUNT(*) FROM logs WHERE service IN ('web', 'api') GROUP BY service" --from 1h
+  ddx logs sql "SELECT service, COUNT(*), AVG(@duration) FROM logs GROUP BY service" --from 1h
+  ddx logs sql "SELECT service, COUNT(*) FROM logs GROUP BY service HAVING COUNT(*) > 100" --from 1h
 
 WHERE translation:
   field = 'value'     →  field:value
@@ -53,19 +55,23 @@ WHERE translation:
 			return fmt.Errorf("SQL parse error: %w", err)
 		}
 
-		// Extract aggregate
-		agg := parsed.HasAggregate()
-		if agg == nil {
+		// Extract all aggregates
+		aggs := parsed.Aggregates()
+		if len(aggs) == 0 {
 			return fmt.Errorf("query must include an aggregate function (COUNT, AVG, SUM, MIN, MAX).\n" +
 				"For raw log search, use: ddx logs search --query \"...\"")
 		}
 
-		// Build compute
-		computeObj := map[string]any{
-			"aggregation": agg.Aggregate,
-		}
-		if agg.Metric != "" && agg.Metric != "*" {
-			computeObj["metric"] = agg.Metric
+		// Build compute — support multiple aggregates
+		var computes []map[string]any
+		for _, agg := range aggs {
+			computeObj := map[string]any{
+				"aggregation": agg.Aggregate,
+			}
+			if agg.Metric != "" && agg.Metric != "*" {
+				computeObj["metric"] = agg.Metric
+			}
+			computes = append(computes, computeObj)
 		}
 
 		// Build filter
@@ -80,7 +86,7 @@ WHERE translation:
 				"from":  timeToISO(from),
 				"to":    timeToISO(to),
 			},
-			"compute": []map[string]any{computeObj},
+			"compute": computes,
 		}
 
 		// Build group_by from parsed GROUP BY (or plain SELECT fields)
@@ -109,6 +115,71 @@ WHERE translation:
 			return err
 		}
 
+		// Apply HAVING filter client-side
+		if parsed.HavingOp != "" {
+			data = applyHaving(data, parsed.HavingOp, parsed.HavingValue)
+		}
+
+		// Show explorer URL
+		if verboseFlag {
+			explorerURL := buildExplorerURL("logs", filter, from, to)
+			fmt.Fprintln(cmd.ErrOrStderr(), "Explorer:", explorerURL)
+		}
+
 		return printData("", data)
 	},
+}
+
+// applyHaving filters aggregate buckets by a threshold on the first compute value.
+func applyHaving(data json.RawMessage, op string, threshold float64) json.RawMessage {
+	var resp struct {
+		Data struct {
+			Buckets []map[string]any `json:"buckets"`
+		} `json:"data"`
+		Meta json.RawMessage `json:"meta"`
+	}
+	if json.Unmarshal(data, &resp) != nil || len(resp.Data.Buckets) == 0 {
+		return data
+	}
+
+	var filtered []map[string]any
+	for _, bucket := range resp.Data.Buckets {
+		computes, ok := bucket["computes"].(map[string]any)
+		if !ok {
+			continue
+		}
+		// Get first compute value (c0)
+		val, ok := computes["c0"].(float64)
+		if !ok {
+			continue
+		}
+		if matchesHaving(val, op, threshold) {
+			filtered = append(filtered, bucket)
+		}
+	}
+
+	result := map[string]any{
+		"data": map[string]any{"buckets": filtered},
+		"meta": resp.Meta,
+	}
+	out, _ := json.Marshal(result)
+	return out
+}
+
+func matchesHaving(val float64, op string, threshold float64) bool {
+	switch op {
+	case ">":
+		return val > threshold
+	case ">=":
+		return val >= threshold
+	case "<":
+		return val < threshold
+	case "<=":
+		return val <= threshold
+	case "=":
+		return val == threshold
+	case "!=":
+		return val != threshold
+	}
+	return true
 }

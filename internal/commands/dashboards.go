@@ -3,7 +3,6 @@ package commands
 import (
 	"context"
 	"encoding/json"
-	"net/url"
 
 	"github.com/spf13/cobra"
 )
@@ -75,28 +74,20 @@ var dashboardsGetCmd = &cobra.Command{
 
 var dashboardsSearchCmd = &cobra.Command{
 	Use:   "search",
-	Short: "Search dashboards by metric, widget type, author, or team",
-	Long: `Search dashboards using rich query syntax.
+	Short: "Search dashboards by title, description, author, or metric",
+	Long: `Search dashboards by matching against title, description, and author handle.
 
 Examples:
-  ddx dashboards search --query "system.cpu.user"
-  ddx dashboards search --query "team:backend"
-  ddx dashboards search --query "widget_type:slo" --sort -popularity`,
+  ddx dashboards search --query "backend"
+  ddx dashboards search --query "cpu"
+  ddx dashboards search --query "nicola"`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, err := getClient(cmd)
 		if err != nil {
 			return err
 		}
 
-		params := url.Values{}
-		if dashboardsQuery != "" {
-			params.Set("filter[shared]", "false")
-			params.Set("filter[deleted]", "false")
-			// Dashboard list API doesn't have dedicated search — we use list + client filter
-			// For now, use the dashboard list endpoint
-		}
-
-		data, err := c.Get(context.Background(), "api/v1/dashboard", params)
+		data, err := c.Get(context.Background(), "api/v1/dashboard", nil)
 		if err != nil {
 			return err
 		}
@@ -108,16 +99,15 @@ Examples:
 			data = resp.Dashboards
 		}
 
-		// Client-side filter by query if provided
 		if dashboardsQuery != "" {
-			data = filterDashboardsByTitle(data, dashboardsQuery)
+			data = filterDashboards(data, dashboardsQuery)
 		}
 
 		return printData("dashboards.search", data)
 	},
 }
 
-func filterDashboardsByTitle(data json.RawMessage, query string) json.RawMessage {
+func filterDashboards(data json.RawMessage, query string) json.RawMessage {
 	var items []map[string]any
 	if json.Unmarshal(data, &items) != nil {
 		return data
@@ -126,7 +116,8 @@ func filterDashboardsByTitle(data json.RawMessage, query string) json.RawMessage
 	for _, item := range items {
 		title, _ := item["title"].(string)
 		desc, _ := item["description"].(string)
-		if containsInsensitive(title, query) || containsInsensitive(desc, query) {
+		author, _ := item["author_handle"].(string)
+		if containsInsensitive(title, query) || containsInsensitive(desc, query) || containsInsensitive(author, query) {
 			filtered = append(filtered, item)
 		}
 	}

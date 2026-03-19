@@ -16,6 +16,7 @@ var (
 	metricsInterval  int
 	metricsRaw       bool
 	metricsCloudCost bool
+	metricsSummary   bool
 	metricsNameFilter string
 	metricsTagFilter  string
 	metricsSubmitName string
@@ -39,6 +40,7 @@ func init() {
 	metricsQueryCmd.Flags().IntVar(&metricsInterval, "interval", 0, "Time bucket interval in milliseconds")
 	metricsQueryCmd.Flags().BoolVar(&metricsRaw, "raw", false, "Return raw CSV data instead of binned stats")
 	metricsQueryCmd.Flags().BoolVar(&metricsCloudCost, "cloud-cost", false, "Query Cloud Cost Management data")
+	metricsQueryCmd.Flags().BoolVar(&metricsSummary, "summary", false, "Return binned stats (min/max/avg per time bucket)")
 	metricsQueryCmd.MarkFlagRequired("queries")
 
 	metricsListCmd.Flags().StringVar(&metricsNameFilter, "name-filter", "", "Substring/wildcard filter (e.g., \"system.cpu\")")
@@ -128,8 +130,79 @@ Examples:
 			return err
 		}
 
+		if metricsSummary {
+			data = computeMetricsSummary(data)
+		}
+
 		return printData("", data)
 	},
+}
+
+func computeMetricsSummary(data json.RawMessage) json.RawMessage {
+	// Datadog timeseries v2 response: attributes.times[], attributes.values[][], attributes.series[]
+	var resp struct {
+		Data struct {
+			Attributes struct {
+				Times  []int64     `json:"times"`
+				Values [][]float64 `json:"values"`
+				Series []struct {
+					QueryIndex int      `json:"query_index"`
+					GroupTags  []string `json:"group_tags"`
+					Unit       []struct {
+						Name string `json:"name"`
+					} `json:"unit"`
+				} `json:"series"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(data, &resp) != nil {
+		return data
+	}
+
+	attrs := resp.Data.Attributes
+	var summaries []map[string]any
+
+	for i, series := range attrs.Series {
+		if i >= len(attrs.Values) {
+			continue
+		}
+		vals := attrs.Values[i]
+		if len(vals) == 0 {
+			continue
+		}
+
+		min, max, sum := vals[0], vals[0], 0.0
+		count := 0
+		for _, v := range vals {
+			if v < min {
+				min = v
+			}
+			if v > max {
+				max = v
+			}
+			sum += v
+			count++
+		}
+
+		s := map[string]any{
+			"query_index": series.QueryIndex,
+			"points":      count,
+			"min":         min,
+			"max":         max,
+			"avg":         sum / float64(count),
+		}
+		if len(series.GroupTags) > 0 {
+			s["group_tags"] = series.GroupTags
+		}
+		if len(series.Unit) > 0 && series.Unit[0].Name != "" {
+			s["unit"] = series.Unit[0].Name
+		}
+
+		summaries = append(summaries, s)
+	}
+
+	out, _ := json.Marshal(summaries)
+	return out
 }
 
 var metricsListCmd = &cobra.Command{

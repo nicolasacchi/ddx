@@ -1,6 +1,11 @@
 package commands
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+)
 
 // flattenV2Items takes a v2 API data array of {"id":"...", "attributes":{...}}
 // and merges id into attributes for a cleaner output.
@@ -37,4 +42,28 @@ func flattenV2Items(data json.RawMessage) json.RawMessage {
 	}
 	out, _ := json.Marshal(result)
 	return out
+}
+
+// buildExplorerURL constructs a deep link to the Datadog UI.
+func buildExplorerURL(explorer, query string, from, to int64) string {
+	site := os.Getenv("DD_SITE")
+	if site == "" {
+		site = "datadoghq.eu"
+	}
+	base := "https://app." + site
+
+	q := url.QueryEscape(query)
+	fromMs := fmt.Sprintf("%d", from*1000)
+	toMs := fmt.Sprintf("%d", to*1000)
+
+	switch explorer {
+	case "logs":
+		return base + "/logs?query=" + q + "&from_ts=" + fromMs + "&to_ts=" + toMs
+	case "rum":
+		return base + "/rum/explorer?query=" + q + "&from_ts=" + fromMs + "&to_ts=" + toMs
+	case "traces":
+		return base + "/apm/traces?query=" + q + "&start=" + fromMs + "&end=" + toMs
+	default:
+		return base
+	}
 }

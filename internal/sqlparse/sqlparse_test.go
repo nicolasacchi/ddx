@@ -160,10 +160,16 @@ func TestParse(t *testing.T) {
 			errSubstr: "JOIN",
 		},
 		{
-			name:      "HAVING rejected",
-			sql:       "SELECT service, COUNT(*) FROM logs GROUP BY service HAVING COUNT(*) > 10",
-			wantErr:   true,
-			errSubstr: "HAVING",
+			name: "HAVING supported",
+			sql:  "SELECT service, COUNT(*) FROM logs GROUP BY service HAVING COUNT(*) > 10",
+			check: func(t *testing.T, q *ParsedQuery) {
+				if q.HavingOp != ">" {
+					t.Errorf("expected HavingOp=>, got %q", q.HavingOp)
+				}
+				if q.HavingValue != 10 {
+					t.Errorf("expected HavingValue=10, got %f", q.HavingValue)
+				}
+			},
 		},
 		{
 			name: "no where clause",
@@ -174,6 +180,22 @@ func TestParse(t *testing.T) {
 				}
 				if q.Limit != 5 {
 					t.Errorf("expected limit=5, got %d", q.Limit)
+				}
+			},
+		},
+		{
+			name: "multiple aggregates",
+			sql:  "SELECT service, COUNT(*), AVG(@duration) FROM logs GROUP BY service",
+			check: func(t *testing.T, q *ParsedQuery) {
+				aggs := q.Aggregates()
+				if len(aggs) != 2 {
+					t.Fatalf("expected 2 aggregates, got %d", len(aggs))
+				}
+				if aggs[0].Aggregate != "count" || aggs[1].Aggregate != "avg" {
+					t.Errorf("expected count+avg, got %s+%s", aggs[0].Aggregate, aggs[1].Aggregate)
+				}
+				if aggs[1].Metric != "@duration" {
+					t.Errorf("expected metric=@duration, got %q", aggs[1].Metric)
 				}
 			},
 		},

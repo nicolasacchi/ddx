@@ -96,7 +96,15 @@ Examples:
 			return err
 		}
 
-		return printData("", extractData(data))
+		result := extractData(data)
+
+		// Add explorer URL
+		if verboseFlag || rumDetailed {
+			explorerURL := buildExplorerURL("rum", rumQuery, from, to)
+			fmt.Fprintln(cmd.ErrOrStderr(), "Explorer:", explorerURL)
+		}
+
+		return printData("", result)
 	},
 }
 
