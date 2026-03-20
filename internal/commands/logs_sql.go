@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/nicolasacchi/ddx/internal/sqlparse"
 	"github.com/spf13/cobra"
 )
 
+var logsSQLExtraCols string
+
 func init() {
 	logsCmd.AddCommand(logsSQLCmd)
+	logsSQLCmd.Flags().StringVar(&logsSQLExtraCols, "extra-columns", "", "JSON typed columns (e.g., '[{\"name\":\"@duration\",\"type\":\"float64\"}]')")
 }
 
 var logsSQLCmd = &cobra.Command{
@@ -19,8 +23,8 @@ var logsSQLCmd = &cobra.Command{
 	Long: `Run SQL queries against logs. Translates SQL to the Datadog aggregate API.
 
 Supported: SELECT with COUNT/AVG/SUM/MIN/MAX (multiple allowed), WHERE, GROUP BY,
-           HAVING, ORDER BY, LIMIT, IN.
-Not supported: JOIN, subqueries, DATE_TRUNC, window functions.
+           HAVING, ORDER BY, LIMIT, IN, DATE_TRUNC.
+Not supported: JOIN, subqueries, window functions.
 
 Examples:
   ddx logs sql "SELECT COUNT(*) FROM logs WHERE status = 'error'" --from 1h
@@ -98,6 +102,17 @@ WHERE translation:
 		if len(groupByFields) > 0 {
 			var groupBy []map[string]any
 			for _, field := range groupByFields {
+				// DATE_TRUNC_hour → timeseries with interval
+				if strings.HasPrefix(field, "DATE_TRUNC_") {
+					unit := strings.TrimPrefix(field, "DATE_TRUNC_")
+					interval := dateTruncInterval(unit)
+					// Add timeseries compute type
+					for i := range computes {
+						computes[i]["type"] = "timeseries"
+						computes[i]["interval"] = interval
+					}
+					continue // Skip adding as group_by facet
+				}
 				gb := map[string]any{
 					"facet": field,
 					"sort":  map[string]any{"order": parsed.SortOrder},
@@ -107,7 +122,18 @@ WHERE translation:
 				}
 				groupBy = append(groupBy, gb)
 			}
-			body["group_by"] = groupBy
+			if len(groupBy) > 0 {
+				body["group_by"] = groupBy
+			}
+		}
+
+		// Extra typed columns
+		if logsSQLExtraCols != "" {
+			var cols []map[string]any
+			if err := json.Unmarshal([]byte(logsSQLExtraCols), &cols); err != nil {
+				return fmt.Errorf("invalid --extra-columns JSON: %w", err)
+			}
+			body["options"] = map[string]any{"extra_columns": cols}
 		}
 
 		data, err := c.Post(context.Background(), "api/v2/logs/analytics/aggregate", body)
@@ -164,6 +190,21 @@ func applyHaving(data json.RawMessage, op string, threshold float64) json.RawMes
 	}
 	out, _ := json.Marshal(result)
 	return out
+}
+
+func dateTruncInterval(unit string) int {
+	switch unit {
+	case "minute":
+		return 60000
+	case "hour":
+		return 3600000
+	case "day":
+		return 86400000
+	case "week":
+		return 604800000
+	default:
+		return 3600000 // default to hour
+	}
 }
 
 func matchesHaving(val float64, op string, threshold float64) bool {

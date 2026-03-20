@@ -9,13 +9,14 @@ import (
 
 // ParsedQuery represents a parsed SQL SELECT statement.
 type ParsedQuery struct {
-	Columns      []Column // SELECT columns
-	Filter       string   // WHERE → Datadog filter query
-	GroupBy      []string // GROUP BY fields
-	Limit        int      // LIMIT value (0 = use default)
-	SortOrder    string   // "desc" or "asc" (from ORDER BY)
-	HavingOp     string   // HAVING operator: ">", ">=", "<", "<=", "="
-	HavingValue  float64  // HAVING threshold value
+	Columns       []Column // SELECT columns
+	Filter        string   // WHERE → Datadog filter query
+	GroupBy       []string // GROUP BY fields
+	Limit         int      // LIMIT value (0 = use default)
+	SortOrder     string   // "desc" or "asc" (from ORDER BY)
+	HavingOp      string   // HAVING operator: ">", ">=", "<", "<=", "="
+	HavingValue   float64  // HAVING threshold value
+	DateTruncUnit string   // DATE_TRUNC unit: "minute", "hour", "day" (empty if not used)
 }
 
 // Column represents a SELECT column — either a plain field or an aggregate.
@@ -401,6 +402,28 @@ func (p *parser) parseOneColumn() (Column, error) {
 		return Column{Field: "*"}, nil
 	}
 
+	// DATE_TRUNC('unit', field) — treat as a plain field with special handling
+	if t.kind == tkWord && strings.EqualFold(t.val, "DATE_TRUNC") {
+		p.next() // DATE_TRUNC
+		if p.peek().kind == tkLParen {
+			p.next() // (
+			unit := p.next().val // 'hour' etc
+			if p.peek().kind == tkComma {
+				p.next() // ,
+			}
+			p.next() // timestamp field name
+			if p.peek().kind == tkRParen {
+				p.next() // )
+			}
+			col := Column{Field: "DATE_TRUNC_" + strings.ToLower(unit)}
+			if p.isWord("AS") {
+				p.next()
+				col.Alias = p.next().val
+			}
+			return col, nil
+		}
+	}
+
 	// Check if this is an aggregate function
 	if t.kind == tkWord && isAggregate(t.val) {
 		agg := strings.ToLower(t.val)
@@ -600,11 +623,29 @@ func (p *parser) parseCondition() (string, error) {
 func (p *parser) parseGroupBy() ([]string, error) {
 	var fields []string
 	for {
-		t := p.next()
-		if t.kind != tkWord {
-			return nil, fmt.Errorf("expected field name in GROUP BY, got %q", t.val)
+		t := p.peek()
+		// Handle DATE_TRUNC('unit', field) in GROUP BY
+		if t.kind == tkWord && strings.EqualFold(t.val, "DATE_TRUNC") {
+			p.next() // DATE_TRUNC
+			if p.peek().kind == tkLParen {
+				p.next() // (
+				unit := p.next().val // 'hour'
+				if p.peek().kind == tkComma {
+					p.next()
+				}
+				p.next() // timestamp
+				if p.peek().kind == tkRParen {
+					p.next()
+				}
+				fields = append(fields, "DATE_TRUNC_"+strings.ToLower(unit))
+			}
+		} else {
+			t = p.next()
+			if t.kind != tkWord {
+				return nil, fmt.Errorf("expected field name in GROUP BY, got %q", t.val)
+			}
+			fields = append(fields, t.val)
 		}
-		fields = append(fields, t.val)
 
 		if p.peek().kind != tkComma {
 			break

@@ -160,10 +160,21 @@ func extractHostField(host map[string]any, field string) string {
 	if v, ok := host[field]; ok {
 		return fmt.Sprintf("%v", v)
 	}
-	// Check meta
+	// Check meta (e.g., meta.instance_type for some hosts)
 	if meta, ok := host["meta"].(map[string]any); ok {
 		if v, ok := meta[field]; ok {
 			return fmt.Sprintf("%v", v)
+		}
+		// Check meta.gohai — it's a JSON string containing platform.instance_type
+		if gohaiStr, ok := meta["gohai"].(string); ok && gohaiStr != "" {
+			var gohai map[string]any
+			if json.Unmarshal([]byte(gohaiStr), &gohai) == nil {
+				if platform, ok := gohai["platform"].(map[string]any); ok {
+					if v, ok := platform[field]; ok {
+						return fmt.Sprintf("%v", v)
+					}
+				}
+			}
 		}
 	}
 	// Check tags for key:value

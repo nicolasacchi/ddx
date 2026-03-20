@@ -133,8 +133,8 @@ Examples:
 
 		params := url.Values{}
 		params.Set("env", "production")
-		params.Set("start", timeToISO(from))
-		params.Set("end", timeToISO(to))
+		params.Set("start", fmt.Sprintf("%d", from))
+		params.Set("end", fmt.Sprintf("%d", to))
 
 		data, err := c.Get(context.Background(), "api/v1/service_dependencies", params)
 		if err != nil {

@@ -44,6 +44,30 @@ func flattenV2Items(data json.RawMessage) json.RawMessage {
 	return out
 }
 
+// extractWithMeta unwraps {"data": [...], "meta": {...}} and prints total count to stderr.
+func extractWithMeta(raw json.RawMessage, cmd string) json.RawMessage {
+	var wrapper struct {
+		Data json.RawMessage `json:"data"`
+		Meta struct {
+			Page struct {
+				TotalCount    int `json:"total_count"`
+				TotalFiltered int `json:"total_filtered_count"`
+			} `json:"page"`
+		} `json:"meta"`
+	}
+	if json.Unmarshal(raw, &wrapper) == nil && wrapper.Data != nil {
+		total := wrapper.Meta.Page.TotalCount
+		if total == 0 {
+			total = wrapper.Meta.Page.TotalFiltered
+		}
+		if total > 0 {
+			fmt.Fprintf(os.Stderr, "%s: %d total results\n", cmd, total)
+		}
+		return wrapper.Data
+	}
+	return raw
+}
+
 // buildExplorerURL constructs a deep link to the Datadog UI.
 func buildExplorerURL(explorer, query string, from, to int64) string {
 	site := os.Getenv("DD_SITE")

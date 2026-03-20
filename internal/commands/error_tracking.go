@@ -64,12 +64,14 @@ Examples:
 			"data": map[string]any{
 				"type": "search_request",
 				"attributes": map[string]any{
-					"query": q,
-					"from":  from * 1000,
-					"to":    to * 1000,
-					"limit": limitFlag,
-					"sort":  "-error_count",
+					"query":   q,
+					"from":    from * 1000,
+					"to":      to * 1000,
+					"sort":    "-error_count",
 					"persona": etTrack,
+					"page": map[string]any{
+						"limit": limitFlag,
+					},
 				},
 			},
 		}

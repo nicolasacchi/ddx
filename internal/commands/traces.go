@@ -64,7 +64,12 @@ Examples:
 			return err
 		}
 
-		return printData("", extractData(data))
+		if verboseFlag {
+			explorerURL := buildExplorerURL("traces", tracesQuery, from, to)
+			fmt.Fprintln(cmd.ErrOrStderr(), "Explorer:", explorerURL)
+		}
+
+		return printData("", extractWithMeta(data, "traces"))
 	},
 }
 

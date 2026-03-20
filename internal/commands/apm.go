@@ -18,6 +18,11 @@ func init() {
 	apmCmd.AddCommand(apmEndpointsCmd)
 	apmCmd.AddCommand(apmErrorsCmd)
 	apmCmd.AddCommand(apmDependenciesCmd)
+	apmCmd.AddCommand(apmStatsCmd)
+
+	apmStatsCmd.Flags().StringVar(&apmService, "service", "", "Service name (required)")
+	apmStatsCmd.Flags().StringVar(&apmEnv, "env", "production", "Environment")
+	apmStatsCmd.MarkFlagRequired("service")
 
 	apmEndpointsCmd.Flags().StringVar(&apmService, "service", "", "Service name (required)")
 	apmEndpointsCmd.Flags().StringVar(&apmEnv, "env", "production", "Environment")
@@ -141,6 +146,65 @@ var apmDependenciesCmd = &cobra.Command{
 		params.Set("end", fmt.Sprintf("%d", to))
 
 		data, err := c.Get(context.Background(), "api/v1/service_dependencies", params)
+		if err != nil {
+			return err
+		}
+
+		return printData("", data)
+	},
+}
+
+var apmStatsCmd = &cobra.Command{
+	Use:   "stats",
+	Short: "Service stats with latency percentiles (p50/p75/p99)",
+	Long: `Get service-level stats including request count, error count, and latency percentiles.
+
+Examples:
+  ddx apm stats --service web-1000farmacie
+  ddx apm stats --service web-1000farmacie --from 4h`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, err := getClient(cmd)
+		if err != nil {
+			return err
+		}
+
+		from, err := parseFrom()
+		if err != nil {
+			return err
+		}
+		to, err := parseTo()
+		if err != nil {
+			return err
+		}
+
+		body := map[string]any{
+			"data": map[string]any{
+				"type": "aggregate_request",
+				"attributes": map[string]any{
+					"filter": map[string]any{
+						"query": fmt.Sprintf("service:%s env:%s", apmService, apmEnv),
+						"from":  timeToISO(from),
+						"to":    timeToISO(to),
+					},
+					"compute": []map[string]any{
+						{"type": "total", "aggregation": "count"},
+						{"type": "total", "aggregation": "avg", "metric": "@duration"},
+						{"type": "total", "aggregation": "pc50", "metric": "@duration"},
+						{"type": "total", "aggregation": "pc75", "metric": "@duration"},
+						{"type": "total", "aggregation": "pc99", "metric": "@duration"},
+					},
+					"group_by": []map[string]any{
+						{
+							"facet": "resource_name",
+							"limit": limitFlag,
+							"sort":  map[string]any{"order": "desc"},
+						},
+					},
+				},
+			},
+		}
+
+		data, err := c.Post(context.Background(), "api/v2/spans/analytics/aggregate", body)
 		if err != nil {
 			return err
 		}
