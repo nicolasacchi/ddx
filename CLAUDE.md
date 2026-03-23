@@ -1,6 +1,6 @@
 # CLAUDE.md — ddx
 
-Go CLI for Datadog. Single binary, JSON output, API key + App key auth.
+Go CLI for Datadog. Single binary, JSON output, API key + App key auth. 34 command groups, SQL log parser, multi-metric formulas, APM stats. Scores 84/90 in empirical comparison — primary Datadog tool alongside MCP (70/90) for JOINs.
 
 **API**: Datadog REST API v1/v2. Base URL derived from `DD_SITE`: `datadoghq.eu` → `https://api.datadoghq.eu`.
 

@@ -1,6 +1,6 @@
 # ddx
 
-CLI for the [Datadog](https://www.datadoghq.com/) API. Query logs, metrics, traces, monitors, incidents, RUM events, and more — with SQL-style log analysis and multi-metric formulas.
+CLI for the [Datadog](https://www.datadoghq.com/) API. 34 command groups covering logs, metrics, traces, monitors, incidents, error tracking, RUM, APM, notebooks, and more — with SQL-style log analysis (HAVING, DATE_TRUNC, multiple aggregates), multi-metric formulas, APM latency percentiles (p50/p75/p99), and parallel health snapshots. Pairs with the [Datadog MCP server](https://docs.datadoghq.com/bits_ai/mcp_server/) for SQL JOINs and trace waterfall views.
 
 ## Install
 
