@@ -81,8 +81,15 @@ Examples:
 			return err
 		}
 
-		issues := extractData(data)
-		return printData("error-tracking.search", flattenV2Items(issues))
+		issues := extractWithMeta(data, "error-tracking")
+		flattened := flattenV2Items(issues)
+
+		// Client-side limit enforcement (API may ignore limit)
+		if limitFlag > 0 {
+			flattened = truncateArray(flattened, limitFlag)
+		}
+
+		return printData("error-tracking.search", flattened)
 	},
 }
 

@@ -108,8 +108,7 @@ Examples:
 			fmt.Fprintln(cmd.ErrOrStderr(), "Explorer:", explorerURL)
 		}
 
-		// Extract the logs array from response
-		logs := extractData(data)
+		logs := extractWithMeta(data, "logs")
 		return printData("logs.search", logs)
 	},
 }

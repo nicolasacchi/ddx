@@ -69,7 +69,7 @@ Examples:
 			fmt.Fprintln(cmd.ErrOrStderr(), "Explorer:", explorerURL)
 		}
 
-		return printData("", extractWithMeta(data, "traces"))
+		return printData("", extractWithMeta(data, "spans"))
 	},
 }
 
@@ -121,7 +121,7 @@ var tracesListCmd = &cobra.Command{
 			return err
 		}
 
-		return printData("", extractData(data))
+		return printData("", extractWithMeta(data, "spans"))
 	},
 }
 

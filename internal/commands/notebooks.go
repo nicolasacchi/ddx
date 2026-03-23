@@ -67,7 +67,7 @@ var notebooksListCmd = &cobra.Command{
 			return err
 		}
 
-		return printData("", extractData(data))
+		return printData("", extractWithMeta(data, "notebooks"))
 	},
 }
 
@@ -109,7 +109,7 @@ var notebooksSearchCmd = &cobra.Command{
 			return err
 		}
 
-		return printData("", extractData(data))
+		return printData("", extractWithMeta(data, "notebooks"))
 	},
 }
 

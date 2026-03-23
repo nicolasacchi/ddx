@@ -68,6 +68,16 @@ func extractWithMeta(raw json.RawMessage, cmd string) json.RawMessage {
 	return raw
 }
 
+// truncateArray limits a JSON array to n items.
+func truncateArray(data json.RawMessage, n int) json.RawMessage {
+	var items []json.RawMessage
+	if json.Unmarshal(data, &items) != nil || len(items) <= n {
+		return data
+	}
+	out, _ := json.Marshal(items[:n])
+	return out
+}
+
 // buildExplorerURL constructs a deep link to the Datadog UI.
 func buildExplorerURL(explorer, query string, from, to int64) string {
 	site := os.Getenv("DD_SITE")

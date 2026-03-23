@@ -96,9 +96,8 @@ Examples:
 			return err
 		}
 
-		result := extractData(data)
+		result := extractWithMeta(data, "rum")
 
-		// Add explorer URL
 		if verboseFlag || rumDetailed {
 			explorerURL := buildExplorerURL("rum", rumQuery, from, to)
 			fmt.Fprintln(cmd.ErrOrStderr(), "Explorer:", explorerURL)
@@ -137,6 +136,6 @@ var rumSessionsCmd = &cobra.Command{
 			return err
 		}
 
-		return printData("", extractData(data))
+		return printData("", extractWithMeta(data, "rum sessions"))
 	},
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -77,9 +78,52 @@ var servicesListCmd = &cobra.Command{
 			}
 		}
 
+		// Also fetch APM-discovered services from dependency map and merge
+		now := time.Now().Unix()
+		dayAgo := now - 86400
+		depsParams := url.Values{}
+		depsParams.Set("env", "production")
+		depsParams.Set("start", fmt.Sprintf("%d", dayAgo))
+		depsParams.Set("end", fmt.Sprintf("%d", now))
+		apmData, err := c.Get(context.Background(), "api/v1/service_dependencies", depsParams)
+		if err == nil {
+			var apmServices map[string]any
+			if json.Unmarshal(apmData, &apmServices) == nil {
+				// Build set of catalog service names
+				catalogNames := map[string]bool{}
+				for _, item := range allItems {
+					var obj map[string]any
+					if json.Unmarshal(item, &obj) == nil {
+						if attrs, ok := obj["attributes"].(map[string]any); ok {
+							if schema, ok := attrs["schema"].(map[string]any); ok {
+								if name, ok := schema["dd-service"].(string); ok {
+									catalogNames[name] = true
+								}
+							}
+						}
+					}
+				}
+				// Add APM services not in catalog
+				for name := range apmServices {
+					if !catalogNames[name] {
+						entry, _ := json.Marshal(map[string]any{
+							"type": "apm-service",
+							"id":   name,
+							"attributes": map[string]any{
+								"schema": map[string]any{"dd-service": name},
+								"meta":   map[string]any{"source": "apm"},
+							},
+						})
+						allItems = append(allItems, entry)
+					}
+				}
+			}
+		}
+
 		if allItems == nil {
 			allItems = []json.RawMessage{}
 		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "services: %d total\n", len(allItems))
 		out, _ := json.Marshal(allItems)
 		return printData("", out)
 	},

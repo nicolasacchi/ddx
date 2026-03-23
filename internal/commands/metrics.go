@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -187,9 +188,11 @@ func computeMetricsSummary(data json.RawMessage) json.RawMessage {
 		s := map[string]any{
 			"query_index": series.QueryIndex,
 			"points":      count,
-			"min":         min,
-			"max":         max,
-			"avg":         sum / float64(count),
+			"overall": map[string]any{
+				"min": min,
+				"max": max,
+				"avg": sum / float64(count),
+			},
 		}
 		if len(series.GroupTags) > 0 {
 			s["group_tags"] = series.GroupTags
@@ -197,6 +200,17 @@ func computeMetricsSummary(data json.RawMessage) json.RawMessage {
 		if len(series.Unit) > 0 && series.Unit[0].Name != "" {
 			s["unit"] = series.Unit[0].Name
 		}
+
+		// Per-bucket breakdown
+		var buckets []map[string]any
+		for j, v := range vals {
+			bucket := map[string]any{"value": v}
+			if j < len(attrs.Times) {
+				bucket["time"] = time.Unix(attrs.Times[j]/1000, 0).UTC().Format(time.RFC3339)
+			}
+			buckets = append(buckets, bucket)
+		}
+		s["buckets"] = buckets
 
 		summaries = append(summaries, s)
 	}
