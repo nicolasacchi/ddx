@@ -1,6 +1,6 @@
 # ddx
 
-CLI for the [Datadog](https://www.datadoghq.com/) API. 34 command groups covering logs, metrics, traces, monitors, incidents, error tracking, RUM, APM, notebooks, and more — with SQL-style log analysis (HAVING, DATE_TRUNC, multiple aggregates), multi-metric formulas, APM latency percentiles (p50/p75/p99), and parallel health snapshots. Pairs with the [Datadog MCP server](https://docs.datadoghq.com/bits_ai/mcp_server/) for SQL JOINs and trace waterfall views.
+CLI for the [Datadog](https://www.datadoghq.com/) API. 35 command groups covering logs, metrics, traces, monitors, incidents, error tracking, RUM, APM, **continuous profiler**, notebooks, and more — with SQL-style log analysis (HAVING, DATE_TRUNC, multiple aggregates), multi-metric formulas, APM latency percentiles (p50/p75/p99), profiler flame-graph aggregation, and parallel health snapshots. Pairs with the [Datadog MCP server](https://docs.datadoghq.com/bits_ai/mcp_server/) for SQL JOINs and trace waterfall views.
 
 ## Install
 
@@ -196,6 +196,33 @@ ddx traces search --query "service:web status:error" --from 1h
 ddx traces get TRACE_ID
 ddx traces list --service web --from 1h
 ```
+
+### `profile` — Continuous Profiler
+
+```bash
+# List individual profile uploads (id, pod, version, size, duration)
+ddx profile list --service web-1000farmacie --query "kube_deployment:web-canary" --from 1h --limit 20
+
+# Top-N endpoints by metric — the headline view
+ddx profile aggregate --service web-1000farmacie --query "kube_deployment:web-canary" \
+  --type alloc-samples --by endpoint --top 20 --from 7d
+
+# Top-N hot functions (flame graph leaves) — drills past endpoint into call sites
+ddx profile aggregate --service web-1000farmacie --type cpu-time --by function --top 30 --from 1h
+
+# Window totals across all profile types (cpu, alloc, heap, wall)
+ddx profile summary --service web-1000farmacie --from 1h
+
+# Per-endpoint delta between two image versions — regression hunting
+ddx profile diff --service web-1000farmacie --type alloc-samples \
+  --before-version v2026.4.57 --after-version v2026.4.58 --from 2d --top 20
+```
+
+Hits `POST /profiling/api/v1/aggregate` (the same endpoint the Datadog UI uses to render the flame graph) and `POST /api/unstable/profiles/list`. Returns server-aggregated JSON — no raw pprof download needed.
+
+**Valid `--type` values** (Ruby): `cpu-time`, `wall-time`, `alloc-samples`, `heap-live-samples`, `heap-live-size`. Note: `alloc-bytes` is **not** supported by the Ruby profiler — it emits allocation count, not byte size.
+
+**`--limit`** sets how many profile uploads the API aggregates server-side (default 50). More profiles → more representative aggregation but slower response. `--top` is independent and trims the displayed results.
 
 ### `services` — Service Catalog & Dependencies
 

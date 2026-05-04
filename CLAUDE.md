@@ -1,6 +1,6 @@
 # CLAUDE.md — ddx
 
-Go CLI for Datadog. Single binary, JSON output, API key + App key auth. 34 command groups, SQL log parser, multi-metric formulas, APM stats. Scores 84/90 in empirical comparison — primary Datadog tool alongside MCP (70/90) for JOINs.
+Go CLI for Datadog. Single binary, JSON output, API key + App key auth. 35 command groups, SQL log parser, multi-metric formulas, APM stats, **continuous-profiler aggregation** (flame graph + per-endpoint hotspots + per-version diff). Scores 84/90 in empirical comparison — primary Datadog tool alongside MCP (70/90) for JOINs.
 
 **API**: Datadog REST API v1/v2. Base URL derived from `DD_SITE`: `datadoghq.eu` → `https://api.datadoghq.eu`.
 
@@ -206,6 +206,56 @@ ddx traces list --service web --from 1h
 ```
 
 **API**: `POST /api/v2/spans/events/search`
+
+### profile
+
+```bash
+ddx profile list      --service web-1000farmacie --query "kube_deployment:web-canary" --from 1h --limit 20
+ddx profile aggregate --service web-1000farmacie --query "kube_deployment:web-canary" \
+                      --type alloc-samples --by endpoint --top 20 --from 7d
+ddx profile aggregate --service web-1000farmacie --type cpu-time --by function --top 30 --from 1h
+ddx profile summary   --service web-1000farmacie --from 1h
+ddx profile diff      --service web-1000farmacie --type alloc-samples \
+                      --before-version v2026.4.57 --after-version v2026.4.58 --from 2d --top 20
+```
+
+**API**: `POST /profiling/api/v1/aggregate` (aggregate, summary, diff), `POST /api/unstable/profiles/list` (list)
+
+The aggregate endpoint is what the Datadog UI calls to render the flame graph. Returns server-aggregated JSON (no raw pprof bytes). Both endpoints accept the standard `DD-API-KEY` + `DD-APPLICATION-KEY` auth and work on `api.datadoghq.eu` and `app.datadoghq.eu`.
+
+**profile shared flags** (list, aggregate, summary, diff):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--service` | — | Datadog service name (required) |
+| `--env` | `production` | Environment |
+| `--query` | — | Additional filter, e.g. `"kube_deployment:web-canary"` |
+
+**profile aggregate flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--type` | `cpu-time` | `cpu-time`, `wall-time`, `alloc-samples`, `heap-live-samples`, `heap-live-size` (Ruby — `alloc-bytes` returns 400) |
+| `--by` | `endpoint` | `endpoint` (top-N endpoints from `endpointValues`), `function` (top-N flame leaves), `summary` (totals only) |
+| `--top` | `20` | Top N results to display |
+
+**profile diff flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--type` | `cpu-time` | Profile type to compare |
+| `--before-version` | — | Image version tag for the 'before' side, e.g. `v2026.4.57` (required) |
+| `--after-version` | — | Image version tag for the 'after' side (required) |
+| `--top` | `20` | Top N endpoints by absolute delta |
+
+**Inherited `--limit`** controls how many profile uploads the API aggregates server-side (default 50). Higher = more representative aggregation, slower response. Independent from `--top` (which trims the displayed result list).
+
+**Output shapes:**
+- `aggregate --by=endpoint`: `{profile_type, profiles_aggregated, profiles_in_window, total, top: [{endpoint, value, percent_of_total}, ...], metadata}`
+- `aggregate --by=function`: `{profile_type, unique_leaf_frames, total, top: [{function, file, line, library, kind, value, percent_of_total}, ...], metadata}`
+- `aggregate --by=summary` / `summary`: `{profiles_aggregated, profiles_in_window, summary_values: {cpu-time, wall-time, alloc-samples, heap-live-samples, heap-live-size, ...}, summary_durations, profile_ids, metadata}`
+- `diff`: `{profile_type, before_version, after_version, before_endpoints, after_endpoints, top_by_abs_delta: [{endpoint, before, after, delta, percent_change}, ...], before_metadata, after_metadata}`
+- `list`: array of profile attribute objects (id, host, pod_name, version, profiler_version, duration, ingest_size_in_bytes, …)
 
 ### services
 
