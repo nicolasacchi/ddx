@@ -217,9 +217,10 @@ ddx profile aggregate --service web-1000farmacie --type cpu-time --by function -
 ddx profile summary   --service web-1000farmacie --from 1h
 ddx profile diff      --service web-1000farmacie --type alloc-samples \
                       --before-version v2026.4.57 --after-version v2026.4.58 --from 2d --top 20
+ddx profile get       --event-id "<id from list>" --profile-id "<profile-id from list>" --by info
 ```
 
-**API**: `POST /profiling/api/v1/aggregate` (aggregate, summary, diff), `POST /api/unstable/profiles/list` (list)
+**API**: `POST /profiling/api/v1/aggregate` (aggregate, summary, diff, get's flame views), `POST /api/unstable/profiles/list` (list), `GET /profiling/api/v1/profiles/{profileId}/info?eventId=X&eventScope=profile` (get --by info)
 
 The aggregate endpoint is what the Datadog UI calls to render the flame graph. Returns server-aggregated JSON (no raw pprof bytes). Both endpoints accept the standard `DD-API-KEY` + `DD-APPLICATION-KEY` auth and work on `api.datadoghq.eu` and `app.datadoghq.eu`.
 
@@ -238,6 +239,22 @@ The aggregate endpoint is what the Datadog UI calls to render the flame graph. R
 | `--type` | `cpu-time` | `cpu-time`, `wall-time`, `alloc-samples`, `heap-live-samples`, `heap-live-size` (Ruby — `alloc-bytes` returns 400) |
 | `--by` | `endpoint` | `endpoint` (top-N endpoints from `endpointValues`), `function` (top-N flame leaves), `summary` (totals only) |
 | `--top` | `20` | Top N results to display |
+
+**profile get flags** (single-profile drill-down — pulls one profile by ID):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--event-id` | — | Long base64 event id from `ddx profile list` field `id` (required) |
+| `--profile-id` | — | Short base64 profile id from `ddx profile list` field `profile-id` (required) |
+| `--by` | `info` | View: `info` (rich per-profile metadata + Ruby GC stats), `endpoint`, `function`, `summary` |
+| `--type` | `cpu-time` | Profile type for endpoint/function/summary views |
+| `--top` | `20` | Top N for endpoint/function views |
+
+`--by info` returns the per-profile metadata: profileStart/End, host, all 60+ tags, system info, **Ruby GC stats** (`heap_live_slots`, `heap_marked_slots`, `minor_gc_count`, `major_gc_count`, `total_allocated_objects`, malloc/oldmalloc increase counters), allocation sampling stats, and full profiler settings. Closest thing to the `runtime.ruby.*` metrics that aren't currently shipping.
+
+`--by endpoint|function|summary` returns the flame-graph data for that one 60-second profile (equivalent to clicking on a profile in the UI explorer's stream view). Internally uses paired `profileIds` + `eventIds` + `eventScopes:["profile"]` arrays in the aggregate request body.
+
+Pipe pattern: `ddx profile list ... --jq '0.{event:id,profile:"profile-id"}'` → copy IDs → `ddx profile get --event-id E --profile-id P`.
 
 **profile diff flags:**
 
@@ -265,6 +282,7 @@ Use `--before-version` / `--after-version` for the common "did this PR regress?"
 - `list` returns a flat array. Use `0` for first element, `#.id` for all IDs — NOT `data.0` (no `data` key after flattening).
 - `aggregate --by endpoint` returns `{top: [...], total, ...}`. Use `top.0.endpoint` for top endpoint, `top.#.endpoint` for the list, `top.#.{e:endpoint,v:value}` for projection.
 - `aggregate --by function` returns `{top: [...], ...}`. Use `top.#.function`, `top.#.file`, etc.
+- `get --by info` returns the per-profile info object directly. Use `customData.internal.gc.heap_live_slots`, `customData.internal.gc.minor_gc_count`, `tags.#`, `systemInfo.runtime.version`, etc.
 
 **Output shapes:**
 - `aggregate --by=endpoint`: `{profile_type, profiles_aggregated, profiles_in_window, total, top: [{endpoint, value, percent_of_total}, ...], metadata}`

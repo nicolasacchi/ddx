@@ -221,6 +221,14 @@ ddx profile diff --service web-1000farmacie --type alloc-samples \
 ddx profile diff --service web-1000farmacie --type alloc-samples \
   --before-query "kube_deployment:web-canary" \
   --after-query  "kube_deployment:worker-canary" --from 1h --top 10
+
+# Single-profile drill-down — pick a profile from `list`, drill in for full metadata
+# (profileStart/End, host, all tags, Ruby GC stats: heap_live_slots, minor/major_gc_count,
+# total_allocated_objects, allocation sampling stats, profiler settings)
+ddx profile get --event-id "<id from list>" --profile-id "<profile-id from list>" --by info
+
+# Per-profile flame leaves (what's hot in this specific 60s sample?)
+ddx profile get --event-id E --profile-id P --by function --type cpu-time --top 20
 ```
 
 Hits `POST /profiling/api/v1/aggregate` (the same endpoint the Datadog UI uses to render the flame graph) and `POST /api/unstable/profiles/list`. Returns server-aggregated JSON — no raw pprof download needed.

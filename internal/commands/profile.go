@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
 
+	"github.com/nicolasacchi/ddx/internal/client"
 	"github.com/spf13/cobra"
 )
 
@@ -65,6 +67,8 @@ var (
 	profileAfterVersion  string
 	profileBeforeQuery   string
 	profileAfterQuery    string
+	profileEventID       string
+	profileProfileID     string
 )
 
 func init() {
@@ -73,6 +77,7 @@ func init() {
 	profileCmd.AddCommand(profileAggregateCmd)
 	profileCmd.AddCommand(profileSummaryCmd)
 	profileCmd.AddCommand(profileDiffCmd)
+	profileCmd.AddCommand(profileGetCmd)
 
 	// Shared flags helper. Cobra holds one variable per Var() call but only the
 	// running command's flag mutates it — safe pattern, used elsewhere in ddx.
@@ -103,6 +108,18 @@ func init() {
 	profileDiffCmd.Flags().StringVar(&profileAfterQuery, "after-query", "",
 		"Arbitrary Datadog filter for the 'after' side (alternative to --after-version)")
 	profileDiffCmd.Flags().IntVar(&profileTopN, "top", 20, "Top N endpoints by absolute delta")
+
+	profileGetCmd.Flags().StringVar(&profileEventID, "event-id", "",
+		"Profile event id, the long base64 string from `ddx profile list` field `id` (required)")
+	profileGetCmd.Flags().StringVar(&profileProfileID, "profile-id", "",
+		"Profile id, the short base64 string from `ddx profile list` field `profile-id` (required)")
+	profileGetCmd.Flags().StringVar(&profileBy, "by", "info",
+		"View: info (rich metadata + GC stats), endpoint (per-endpoint top), function (flame leaves), summary (totals)")
+	profileGetCmd.Flags().StringVar(&profileType, "type", defaultProfileType,
+		"Profile type for endpoint/function/summary views: cpu-time, wall-time, alloc-samples, heap-live-samples, heap-live-size")
+	profileGetCmd.Flags().IntVar(&profileTopN, "top", 20, "Top N results for endpoint/function views")
+	_ = profileGetCmd.MarkFlagRequired("event-id")
+	_ = profileGetCmd.MarkFlagRequired("profile-id")
 }
 
 // ----------------------------------------------------------------------------
@@ -354,6 +371,122 @@ Examples:
 		}
 		return printData("", jsonBytes)
 	},
+}
+
+// ----------------------------------------------------------------------------
+// get — single-profile metadata + flame graph
+//
+// API:
+//   GET  /profiling/api/v1/profiles/{profileId}/info?eventId=X&eventScope=profile
+//   POST /profiling/api/v1/aggregate (with paired profileIds + eventIds + eventScopes)
+//
+// The list endpoint returns BOTH IDs per profile:
+//   data[i].id              — long base64 (the eventId)
+//   data[i].attributes.id   — short base64 (the profileId)
+//
+// In our flattened `ddx profile list` output these surface as `id` (eventId)
+// and `profile-id` (profileId) — pipe both into `ddx profile get`.
+// ----------------------------------------------------------------------------
+
+var profileGetCmd = &cobra.Command{
+	Use:   "get",
+	Short: "Single-profile drill-down — rich metadata + per-profile flame graph",
+	Long: `Pull a single profile's data by its (event-id, profile-id) pair.
+
+Default --by info returns the full per-profile metadata: profileStart/End, host,
+all 60+ tags, system info (runtime version, kernel), GC stats (heap_marked_slots,
+minor_gc_count, major_gc_count, total_allocated_objects), allocation sampling
+stats, and full profiler settings. This is the closest thing we have to the
+runtime.ruby.* metrics that aren't shipping to Datadog.
+
+--by endpoint|function|summary returns the flame-graph data for THAT one profile
+(equivalent to clicking on a profile in the UI explorer's stream view).
+
+Examples:
+  # Pick a profile from the list, then drill in for full metadata
+  ddx profile list --service web-1000farmacie --query "kube_deployment:web-canary" \
+    --from 1h --limit 5 --jq '0.{event:id,profile:"profile-id",pod:tag.pod_name}'
+  # Then:
+  ddx profile get --event-id "AwAAAZ33...AAAA" --profile-id "AZ33SqdJ...AA"
+
+  # Per-profile flame leaves (what's hot in this specific 60s sample?)
+  ddx profile get --event-id E --profile-id P --by function --top 20
+
+  # Per-profile endpoint hotspots (which endpoints did this pod serve in this 60s?)
+  ddx profile get --event-id E --profile-id P --by endpoint --top 10 --type alloc-samples`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, err := getClient(cmd)
+		if err != nil {
+			return err
+		}
+
+		switch profileBy {
+		case "info":
+			return runProfileGetInfo(c)
+		case "endpoint":
+			if !validProfileTypes[profileType] {
+				return invalidProfileTypeError(profileType)
+			}
+			raw, err := callSingleProfileAggregate(c, profileType)
+			if err != nil {
+				return err
+			}
+			return printProfileEndpointView(raw, profileType, profileTopN)
+		case "function":
+			if !validProfileTypes[profileType] {
+				return invalidProfileTypeError(profileType)
+			}
+			raw, err := callSingleProfileAggregate(c, profileType)
+			if err != nil {
+				return err
+			}
+			return printProfileFunctionView(raw, profileType, profileTopN)
+		case "summary":
+			raw, err := callSingleProfileAggregate(c, defaultProfileType)
+			if err != nil {
+				return err
+			}
+			return printProfileSummaryView(raw)
+		default:
+			return fmt.Errorf("invalid --by %q for `get`, want one of: info, endpoint, function, summary", profileBy)
+		}
+	},
+}
+
+// runProfileGetInfo calls the per-profile info endpoint and prints the body.
+func runProfileGetInfo(c *client.Client) error {
+	path := fmt.Sprintf("profiling/api/v1/profiles/%s/info", profileProfileID)
+	params := url.Values{}
+	params.Set("eventId", profileEventID)
+	params.Set("eventScope", "profile")
+	raw, err := c.Get(context.Background(), path, params)
+	if err != nil {
+		return err
+	}
+	return printData("", raw)
+}
+
+// callSingleProfileAggregate POSTs the per-profile aggregate body to the same
+// /aggregate endpoint, but using paired profileIds+eventIds+eventScopes arrays
+// (which select a single profile by ID instead of running a query).
+//
+// The from/to fields must be present (zero epoch is fine — API ignores time
+// when profileIds are specified) per the schema. randomizeProfiles=false to
+// preserve deterministic single-profile mapping.
+func callSingleProfileAggregate(c *client.Client, profType string) (json.RawMessage, error) {
+	body := map[string]any{
+		"profileIds":          []string{profileProfileID},
+		"eventIds":            []string{profileEventID},
+		"eventScopes":         []string{"profile"},
+		"profileType":         profType,
+		"aggregationFunction": "sum",
+		"attribute":           "line",
+		"limit":               1,
+		"from":                "1970-01-01T00:00:00.000Z",
+		"to":                  "1970-01-01T00:00:00.000Z",
+		"randomizeProfiles":   false,
+	}
+	return c.Post(context.Background(), profileAggregateEndpoint, body)
 }
 
 // resolveDiffSide picks the clause + label for one diff side ("before" or
