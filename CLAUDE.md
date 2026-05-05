@@ -244,11 +244,27 @@ The aggregate endpoint is what the Datadog UI calls to render the flame graph. R
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--type` | `cpu-time` | Profile type to compare |
-| `--before-version` | — | Image version tag for the 'before' side, e.g. `v2026.4.57` (required) |
-| `--after-version` | — | Image version tag for the 'after' side (required) |
+| `--before-version` | — | Image version tag for the 'before' side, e.g. `v2026.4.57` (one of `--before-version` / `--before-query` required) |
+| `--after-version` | — | Image version tag for the 'after' side (one of `--after-version` / `--after-query` required) |
+| `--before-query` | — | Arbitrary Datadog filter for the 'before' side (alternative to `--before-version`), e.g. `"pod_name:web-canary-X"` or `"@timestamp:[now-2h TO now-1h]"` |
+| `--after-query` | — | Arbitrary Datadog filter for the 'after' side |
 | `--top` | `20` | Top N endpoints by absolute delta |
 
+Use `--before-version` / `--after-version` for the common "did this PR regress?" case. Use `--before-query` / `--after-query` for arbitrary diffs (canary-vs-prod, pod-A-vs-pod-B, peak-hours-vs-off-hours).
+
 **Inherited `--limit`** controls how many profile uploads the API aggregates server-side (default 50). Higher = more representative aggregation, slower response. Independent from `--top` (which trims the displayed result list).
+
+**Known API limitations** (verified against Datadog's `/profiling/api/v1/aggregate`):
+
+- **No endpoint-scoped flame graph.** The API has no way to scope `--by function` results to a single endpoint. Per-frame data carries no endpoint dimension; only `endpointValues` (flat per-endpoint totals) is exposed. The Datadog UI's Endpoint facet is display-only and doesn't trigger re-aggregation either. Workaround: use `--by endpoint` to find heavy endpoints + `--by function` to find hot leaves across the deployment, then mentally cross-reference (or enable APM-profile correlation in `dd-trace-rb` so per-endpoint allocation tags land on spans).
+- **`--type alloc-bytes` returns HTTP 400 for Ruby.** Caught pre-flight with a Ruby-specific error message. Use `alloc-samples` (allocation count) instead.
+- **Heap-live samples have no endpoint attribution.** Ruby's retained-heap profiler emits all samples as `_UNASSIGNED_`. `--type heap-live-samples --by endpoint` will emit a stderr hint suggesting `--by function`. The function view IS informative for retained-heap analysis.
+
+**`--jq` is gjson, not jq** (general ddx note worth restating for profile output):
+
+- `list` returns a flat array. Use `0` for first element, `#.id` for all IDs — NOT `data.0` (no `data` key after flattening).
+- `aggregate --by endpoint` returns `{top: [...], total, ...}`. Use `top.0.endpoint` for top endpoint, `top.#.endpoint` for the list, `top.#.{e:endpoint,v:value}` for projection.
+- `aggregate --by function` returns `{top: [...], ...}`. Use `top.#.function`, `top.#.file`, etc.
 
 **Output shapes:**
 - `aggregate --by=endpoint`: `{profile_type, profiles_aggregated, profiles_in_window, total, top: [{endpoint, value, percent_of_total}, ...], metadata}`

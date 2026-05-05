@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -62,6 +63,8 @@ var (
 	profileTopN          int
 	profileBeforeVersion string
 	profileAfterVersion  string
+	profileBeforeQuery   string
+	profileAfterQuery    string
 )
 
 func init() {
@@ -92,12 +95,14 @@ func init() {
 
 	profileDiffCmd.Flags().StringVar(&profileType, "type", defaultProfileType, "Profile type (see aggregate --type)")
 	profileDiffCmd.Flags().StringVar(&profileBeforeVersion, "before-version", "",
-		"Image version tag for the 'before' side, e.g. v2026.4.57 (required)")
+		"Image version tag for the 'before' side, e.g. v2026.4.57 (one of --before-version / --before-query required)")
 	profileDiffCmd.Flags().StringVar(&profileAfterVersion, "after-version", "",
-		"Image version tag for the 'after' side, e.g. v2026.4.58 (required)")
+		"Image version tag for the 'after' side, e.g. v2026.4.58 (one of --after-version / --after-query required)")
+	profileDiffCmd.Flags().StringVar(&profileBeforeQuery, "before-query", "",
+		"Arbitrary Datadog filter for the 'before' side (alternative to --before-version), e.g. 'pod_name:web-canary-X' or '@timestamp:[now-2h TO now-1h]'")
+	profileDiffCmd.Flags().StringVar(&profileAfterQuery, "after-query", "",
+		"Arbitrary Datadog filter for the 'after' side (alternative to --after-version)")
 	profileDiffCmd.Flags().IntVar(&profileTopN, "top", 20, "Top N endpoints by absolute delta")
-	_ = profileDiffCmd.MarkFlagRequired("before-version")
-	_ = profileDiffCmd.MarkFlagRequired("after-version")
 }
 
 // ----------------------------------------------------------------------------
@@ -198,7 +203,7 @@ Examples:
   ddx profile aggregate --service web-1000farmacie --by summary --from 1h`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !validProfileTypes[profileType] {
-			return fmt.Errorf("invalid --type %q, want one of: cpu-time, wall-time, alloc-samples, heap-live-samples, heap-live-size", profileType)
+			return invalidProfileTypeError(profileType)
 		}
 		if !validProfileBy[profileBy] {
 			return fmt.Errorf("invalid --by %q, want one of: endpoint, function, summary", profileBy)
@@ -270,10 +275,14 @@ Examples:
 
 var profileDiffCmd = &cobra.Command{
 	Use:   "diff",
-	Short: "Per-endpoint delta between two image versions",
-	Long: `Compare profiler endpointValues between two image-version filters.
-Useful for "did this PR introduce a regression" — set --before-version to the
-last good tag and --after-version to the suspected one.
+	Short: "Per-endpoint delta between two arbitrary scopes (versions, pods, time windows, etc.)",
+	Long: `Compare profiler endpointValues between two filter scopes.
+Useful for "did this PR introduce a regression" or "is one canary pod
+allocating more than another."
+
+You must specify each side either by version tag (--before-version / --after-version)
+which compose into "version:vXXX" clauses, OR by an arbitrary --before-query /
+--after-query string for non-version comparisons (pods, time slices, etc.).
 
 Examples:
   # Did v2026.4.58 increase allocation rate vs v2026.4.57?
@@ -283,11 +292,31 @@ Examples:
   # CPU regression check on canary
   ddx profile diff --service web-1000farmacie --type cpu-time \
     --query "kube_deployment:web-canary" \
-    --before-version v2026.4.42 --after-version v2026.4.43 --from 5d --top 30`,
+    --before-version v2026.4.42 --after-version v2026.4.43 --from 5d --top 30
+
+  # Compare two specific pods
+  ddx profile diff --service web-1000farmacie --type alloc-samples \
+    --before-query "pod_name:web-canary-abc-1" \
+    --after-query  "pod_name:web-canary-abc-2" --from 1h
+
+  # Canary vs primary deployment (different deployments)
+  ddx profile diff --service web-1000farmacie --type alloc-samples \
+    --before-query "kube_deployment:web-canary" \
+    --after-query  "kube_deployment:web" --from 1h`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !validProfileTypes[profileType] {
-			return fmt.Errorf("invalid --type %q, want one of: cpu-time, wall-time, alloc-samples, heap-live-samples, heap-live-size", profileType)
+			return invalidProfileTypeError(profileType)
 		}
+		// Resolve before/after filter clauses; require at least one form per side.
+		beforeClause, beforeLabel, err := resolveDiffSide("before", profileBeforeVersion, profileBeforeQuery)
+		if err != nil {
+			return err
+		}
+		afterClause, afterLabel, err := resolveDiffSide("after", profileAfterVersion, profileAfterQuery)
+		if err != nil {
+			return err
+		}
+
 		c, err := getClient(cmd)
 		if err != nil {
 			return err
@@ -297,8 +326,8 @@ Examples:
 			return err
 		}
 
-		beforeQuery := buildProfileQuery("version:" + profileBeforeVersion)
-		afterQuery := buildProfileQuery("version:" + profileAfterVersion)
+		beforeQuery := buildProfileQuery(beforeClause)
+		afterQuery := buildProfileQuery(afterClause)
 
 		beforeRaw, err := callProfileAggregate(c, beforeQuery, from, to, profileType, limitFlag)
 		if err != nil {
@@ -318,13 +347,40 @@ Examples:
 			return fmt.Errorf("after parse: %w", err)
 		}
 
-		out := buildEndpointDiff(beforeEndpoints, afterEndpoints, profileBeforeVersion, profileAfterVersion, profileType, profileTopN, beforeMeta, afterMeta)
+		out := buildEndpointDiff(beforeEndpoints, afterEndpoints, beforeLabel, afterLabel, profileType, profileTopN, beforeMeta, afterMeta)
 		jsonBytes, err := json.Marshal(out)
 		if err != nil {
 			return err
 		}
 		return printData("", jsonBytes)
 	},
+}
+
+// resolveDiffSide picks the clause + label for one diff side ("before" or
+// "after"). Exactly one of version or query must be set per side.
+func resolveDiffSide(side, version, query string) (clause, label string, err error) {
+	hasVersion := version != ""
+	hasQuery := query != ""
+	if hasVersion && hasQuery {
+		return "", "", fmt.Errorf("--%s-version and --%s-query are mutually exclusive (set one)", side, side)
+	}
+	if !hasVersion && !hasQuery {
+		return "", "", fmt.Errorf("must set --%s-version or --%s-query", side, side)
+	}
+	if hasVersion {
+		return "version:" + version, version, nil
+	}
+	return query, query, nil
+}
+
+// invalidProfileTypeError emits a clear error for unsupported --type values,
+// with a Ruby-specific hint when the user requested alloc-bytes.
+func invalidProfileTypeError(profType string) error {
+	const ruby = "(Ruby valid types: cpu-time, wall-time, alloc-samples, heap-live-samples, heap-live-size)"
+	if profType == "alloc-bytes" {
+		return fmt.Errorf("--type alloc-bytes is not supported by the Ruby profiler — it emits allocation count, not byte size. Use --type alloc-samples instead %s", ruby)
+	}
+	return fmt.Errorf("invalid --type %q %s", profType, ruby)
 }
 
 // ============================================================================
@@ -422,6 +478,10 @@ type endpointEntry struct {
 // printProfileEndpointView extracts endpointValues, sorts by value desc,
 // computes percent of total (using summaryValues[profileType]), and emits
 // a JSON view: {top: [...], total, profile_type, profiles_aggregated, profiles_in_window, metadata}.
+//
+// For heap-live-samples / heap-live-size profile types where _UNASSIGNED_
+// dominates the result (>80 %), emits a stderr hint suggesting --by function
+// because Ruby's heap profiler doesn't attribute retained memory to endpoints.
 func printProfileEndpointView(raw json.RawMessage, profType string, topN int) error {
 	var resp aggregateResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
@@ -448,6 +508,19 @@ func printProfileEndpointView(raw json.RawMessage, profType string, topN int) er
 			endpoints[i].Percent = endpoints[i].Value / total * 100.0
 		}
 	}
+
+	// For heap-live-* types, warn when _UNASSIGNED_ swamps the result —
+	// Ruby's retained-heap samples lack endpoint attribution, so endpoint
+	// view is uninformative; function view is what the user wants.
+	if (profType == "heap-live-samples" || profType == "heap-live-size") && total > 0 {
+		if v, ok := resp.EndpointValues["_UNASSIGNED_"]; ok && v/total > 0.80 {
+			fmt.Fprintf(os.Stderr,
+				"hint: --type %s --by endpoint is uninformative because Ruby's retained-heap profiler doesn't tag samples with endpoints (_UNASSIGNED_=%.0f %% here). Try --by function instead.\n",
+				profType, v/total*100,
+			)
+		}
+	}
+
 	if topN > 0 && len(endpoints) > topN {
 		endpoints = endpoints[:topN]
 	}

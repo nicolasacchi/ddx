@@ -216,13 +216,20 @@ ddx profile summary --service web-1000farmacie --from 1h
 # Per-endpoint delta between two image versions — regression hunting
 ddx profile diff --service web-1000farmacie --type alloc-samples \
   --before-version v2026.4.57 --after-version v2026.4.58 --from 2d --top 20
+
+# Per-endpoint delta between two arbitrary scopes — pod-vs-pod, canary-vs-prod, etc.
+ddx profile diff --service web-1000farmacie --type alloc-samples \
+  --before-query "kube_deployment:web-canary" \
+  --after-query  "kube_deployment:worker-canary" --from 1h --top 10
 ```
 
 Hits `POST /profiling/api/v1/aggregate` (the same endpoint the Datadog UI uses to render the flame graph) and `POST /api/unstable/profiles/list`. Returns server-aggregated JSON — no raw pprof download needed.
 
-**Valid `--type` values** (Ruby): `cpu-time`, `wall-time`, `alloc-samples`, `heap-live-samples`, `heap-live-size`. Note: `alloc-bytes` is **not** supported by the Ruby profiler — it emits allocation count, not byte size.
+**Valid `--type` values** (Ruby): `cpu-time`, `wall-time`, `alloc-samples`, `heap-live-samples`, `heap-live-size`. Note: `alloc-bytes` is **not** supported by the Ruby profiler — it emits allocation count, not byte size. The CLI catches this pre-flight with a clear error.
 
 **`--limit`** sets how many profile uploads the API aggregates server-side (default 50). More profiles → more representative aggregation but slower response. `--top` is independent and trims the displayed results.
+
+**Known limitations**: the Datadog Profiler API does NOT support endpoint-scoped flame graphs (`--by function` is always cross-endpoint; verified against the UI which has the same limitation). Heap-live samples have no endpoint attribution in Ruby — `--type heap-live-samples --by endpoint` returns 100 % `_UNASSIGNED_` and the CLI emits a stderr hint suggesting `--by function` instead.
 
 ### `services` — Service Catalog & Dependencies
 
