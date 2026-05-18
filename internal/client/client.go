@@ -75,6 +75,12 @@ func (c *Client) Put(ctx context.Context, path string, body any) (json.RawMessag
 	return c.doJSON(ctx, http.MethodPut, u, body)
 }
 
+// Patch performs a PATCH request with a JSON body.
+func (c *Client) Patch(ctx context.Context, path string, body any) (json.RawMessage, error) {
+	u := c.buildURL(path, nil)
+	return c.doJSON(ctx, http.MethodPatch, u, body)
+}
+
 // Delete performs a DELETE request.
 func (c *Client) Delete(ctx context.Context, path string) error {
 	u := c.buildURL(path, nil)

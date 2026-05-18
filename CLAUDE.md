@@ -142,9 +142,12 @@ ddx incidents list --query "state:active severity:SEV-1"
 ddx incidents list --query "(state:active OR state:stable) AND team:backend"
 ddx incidents get INCIDENT_ID --timeline
 ddx incidents facets --query "state:active"
+ddx incidents update 45 --severity SEV-3 --summary "Re-classified after triage"
+ddx incidents update 45 --root-cause-file ./rca.md
+ddx incidents resolve 45 --root-cause "Backfill drained; self-healed"
 ```
 
-**API**: `GET /api/v2/incidents/search`
+**API**: `GET /api/v2/incidents/search` (list/facets), `GET /api/v2/incidents/{uuid}` (get + public-id→UUID resolution), `PATCH /api/v2/incidents/{uuid}` (update/resolve)
 
 **incidents list flags:**
 
@@ -158,6 +161,30 @@ ddx incidents facets --query "state:active"
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--timeline` | false | Include timeline with comments and status changes |
+
+**incidents update flags** (PATCH — only flags you pass are sent; other fields are left untouched):
+
+| Flag | Description |
+|------|-------------|
+| `--state` | `active`, `stable`, `resolved` (mapped to `fields.state.value`) |
+| `--severity` | `SEV-1` … `SEV-5` (mapped to `fields.severity.value`) |
+| `--root-cause` | Inline text for `fields.root_cause.value` |
+| `--root-cause-file` | Path to file (or `-` for stdin) holding the root-cause text. Mutually exclusive with `--root-cause` |
+| `--summary` | Inline text for `fields.summary.value` |
+| `--resolved` | RFC3339 timestamp or `now`; auto-set to `now` when `--state=resolved` and not supplied explicitly |
+
+**incidents resolve flags** (shortcut for `update --state resolved --resolved now`):
+
+| Flag | Description |
+|------|-------------|
+| `--root-cause` | Inline text for `fields.root_cause.value` |
+| `--root-cause-file` | Path/`-` for stdin. Mutually exclusive with `--root-cause` |
+
+**ID resolution**: `update` and `resolve` accept the public id (`45`) or the UUID. Public ids trigger one `GET /api/v2/incidents/{id}` to fetch the UUID before the PATCH (the PATCH endpoint requires UUID, not public id). Pass the UUID directly to skip the round-trip.
+
+**Field shape**: each field is sent as `{"type": "...", "value": "..."}`. ddx hard-codes the type for the documented fields (`state`/`severity` → `dropdown`, `root_cause`/`summary` → `textbox`) via `incidentFieldTypes` in `internal/commands/incidents.go`. Add an entry there to surface a new field.
+
+**No `--confirm` gate**: matches the rest of ddx (`notebooks create/edit/delete`, `downtimes cancel`). Same `DD_APP_KEY` is used for reads and writes.
 
 ### error-tracking
 

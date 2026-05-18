@@ -162,7 +162,11 @@ ddx incidents list                                           # Active incidents
 ddx incidents list --query "state:active severity:SEV-1"     # Filtered
 ddx incidents get INCIDENT_ID --timeline                     # With timeline
 ddx incidents facets --query "state:active"                  # Faceted counts
+ddx incidents update 45 --severity SEV-3 --summary "..."     # Patch fields
+ddx incidents resolve 45 --root-cause-file ./rca.md          # state=resolved, resolved=now
 ```
+
+`update` and `resolve` accept either the public id (`45`) or the UUID. When the public id is passed, ddx does a `GET /api/v2/incidents/{id}` first to resolve the UUID the PATCH endpoint requires.
 
 ### `error-tracking` — Error Tracking
 
