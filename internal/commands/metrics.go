@@ -12,12 +12,12 @@ import (
 )
 
 var (
-	metricsQueries   []string
-	metricsFormulas  []string
-	metricsInterval  int
-	metricsRaw       bool
-	metricsCloudCost bool
-	metricsSummary   bool
+	metricsQueries    []string
+	metricsFormulas   []string
+	metricsInterval   int
+	metricsRaw        bool
+	metricsCloudCost  bool
+	metricsSummary    bool
 	metricsNameFilter string
 	metricsTagFilter  string
 	metricsSubmitName string

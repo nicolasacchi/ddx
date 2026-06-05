@@ -10,11 +10,11 @@ import (
 )
 
 var (
-	tracesQuery        string
-	tracesCustomAttr   string
-	tracesService      string
-	traceServiceEntry  bool
-	traceIncludePath   string
+	tracesQuery       string
+	tracesCustomAttr  string
+	tracesService     string
+	traceServiceEntry bool
+	traceIncludePath  string
 )
 
 func init() {

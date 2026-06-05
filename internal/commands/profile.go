@@ -659,14 +659,14 @@ func printProfileEndpointView(raw json.RawMessage, profType string, topN int) er
 	}
 
 	out := map[string]any{
-		"profile_type":         profType,
-		"aggregation":          resp.AggregationFunction,
-		"profiles_aggregated":  resp.NumberOfProfiles,
-		"profiles_in_window":   resp.TotalProfilesCount,
-		"endpoints_total":      len(resp.EndpointValues),
-		"total":                total,
-		"top":                  endpoints,
-		"metadata":             resp.Metadata,
+		"profile_type":        profType,
+		"aggregation":         resp.AggregationFunction,
+		"profiles_aggregated": resp.NumberOfProfiles,
+		"profiles_in_window":  resp.TotalProfilesCount,
+		"endpoints_total":     len(resp.EndpointValues),
+		"total":               total,
+		"top":                 endpoints,
+		"metadata":            resp.Metadata,
 	}
 	jsonBytes, err := json.Marshal(out)
 	if err != nil {
@@ -720,11 +720,11 @@ func extractEndpointValues(raw json.RawMessage) (map[string]float64, json.RawMes
 
 // diffRow is one row in the diff table.
 type diffRow struct {
-	Endpoint    string  `json:"endpoint"`
-	Before      float64 `json:"before"`
-	After       float64 `json:"after"`
-	Delta       float64 `json:"delta"`
-	PercentChg  float64 `json:"percent_change"`
+	Endpoint   string  `json:"endpoint"`
+	Before     float64 `json:"before"`
+	After      float64 `json:"after"`
+	Delta      float64 `json:"delta"`
+	PercentChg float64 `json:"percent_change"`
 }
 
 // buildEndpointDiff joins two endpoint maps by endpoint name and computes
@@ -766,14 +766,14 @@ func buildEndpointDiff(before, after map[string]float64, beforeVer, afterVer, pr
 	}
 
 	return map[string]any{
-		"profile_type":      profType,
-		"before_version":    beforeVer,
-		"after_version":     afterVer,
-		"before_endpoints":  len(before),
-		"after_endpoints":   len(after),
-		"top_by_abs_delta":  rows,
-		"before_metadata":   beforeMeta,
-		"after_metadata":    afterMeta,
+		"profile_type":     profType,
+		"before_version":   beforeVer,
+		"after_version":    afterVer,
+		"before_endpoints": len(before),
+		"after_endpoints":  len(after),
+		"top_by_abs_delta": rows,
+		"before_metadata":  beforeMeta,
+		"after_metadata":   afterMeta,
 	}
 }
 
