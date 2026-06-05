@@ -1,6 +1,7 @@
 package commands
 
 import (
+	cliout "github.com/nicolasacchi/clicore/output"
 	"github.com/nicolasacchi/ddx/internal/client"
 	"github.com/nicolasacchi/ddx/internal/config"
 	"github.com/nicolasacchi/ddx/internal/output"
@@ -62,6 +63,9 @@ func isJSONMode() bool {
 }
 
 func printData(command string, data []byte) error {
+	// Agent-mode row cap: under CLAUDECODE an unbounded list is capped to keep
+	// agent context manageable; an explicit --limit always wins. Shape-safe.
+	data = cliout.CapAgentArray(data, limitFlag)
 	return output.PrintData(command, data, isJSONMode(), jqFlag)
 }
 
