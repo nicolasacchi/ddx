@@ -40,6 +40,8 @@ site = "datadoghq.eu"
 | `--limit` | 50 | Max results |
 | `--verbose` | false | Print request/response to stderr |
 | `--quiet` | false | Suppress non-error output |
+| `--yes` / `--confirm` | false | Confirm destructive operations (mute/delete/cancel/resolve/submit) |
+| `--dry-run` | false | Print the intended mutation and exit without sending |
 
 ## Commands
 
@@ -184,7 +186,7 @@ ddx incidents resolve 45 --root-cause "Backfill drained; self-healed"
 
 **Field shape**: each field is sent as `{"type": "...", "value": "..."}`. ddx hard-codes the type for the documented fields (`state`/`severity` → `dropdown`, `root_cause`/`summary` → `textbox`) via `incidentFieldTypes` in `internal/commands/incidents.go`. Add an entry there to surface a new field.
 
-**No `--confirm` gate**: matches the rest of ddx (`notebooks create/edit/delete`, `downtimes cancel`). Same `DD_APP_KEY` is used for reads and writes.
+**Write-safety gate**: state-changing verbs (`incidents update`/`resolve`, `monitors mute`/`delete`, `downtimes cancel`, `notebooks delete`, `metrics submit`) refuse unless `--yes`/`--confirm` is passed, exiting code `6` (`write_locked`); `--dry-run` previews the change and sends nothing. Reads and recovery ops (`monitors unmute`, `notebooks create`/`edit`) are ungated. Automation must pass `--yes` explicitly. Same `DD_APP_KEY` is used for reads and writes.
 
 ### error-tracking
 
@@ -486,6 +488,7 @@ JOIN, HAVING, subqueries, CTEs, DATE_TRUNC, window functions, multiple aggregate
 | 1 | API/network error |
 | 2 | Auth error (401/403) |
 | 4 | Not found (404) |
+| 6 | Write refused — confirmation required (`write_locked`); re-run with `--yes` |
 
 ## Architecture
 

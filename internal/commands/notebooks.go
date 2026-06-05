@@ -282,6 +282,13 @@ var notebooksDeleteCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if dryRun() {
+			fmt.Fprintf(cmd.OutOrStdout(), "--dry-run: would delete notebook %s, no changes made\n", args[0])
+			return nil
+		}
+		if err := requireConfirm(fmt.Sprintf("deleting notebook %s", args[0])); err != nil {
+			return err
+		}
 		if err := c.Delete(context.Background(), "api/v1/notebooks/"+args[0]); err != nil {
 			return err
 		}

@@ -61,6 +61,13 @@ var downtimesCancelCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if dryRun() {
+			fmt.Fprintf(cmd.OutOrStdout(), "--dry-run: would cancel downtime %s, no changes made\n", args[0])
+			return nil
+		}
+		if err := requireConfirm(fmt.Sprintf("cancelling downtime %s", args[0])); err != nil {
+			return err
+		}
 		if err := c.Delete(context.Background(), "api/v2/downtime/"+args[0]); err != nil {
 			return err
 		}

@@ -316,6 +316,14 @@ func resolveIncidentUUID(ctx context.Context, c *client.Client, id string) (stri
 // map already shaped for the incident schema; resolvedTS is set as the
 // top-level "resolved" attribute when non-empty.
 func patchIncident(cmd *cobra.Command, c *client.Client, id string, fields map[string]any, resolvedTS string) error {
+	// Gate before the UUID-resolution round-trip so --dry-run sends nothing.
+	if dryRun() {
+		fmt.Fprintf(cmd.OutOrStdout(), "--dry-run: would PATCH incident %s (fields=%v resolved=%q), no changes made\n", id, fields, resolvedTS)
+		return nil
+	}
+	if err := requireConfirm(fmt.Sprintf("updating incident %s", id)); err != nil {
+		return err
+	}
 	ctx := context.Background()
 	uuid, err := resolveIncidentUUID(ctx, c, id)
 	if err != nil {

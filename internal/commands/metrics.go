@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
@@ -12,12 +13,12 @@ import (
 )
 
 var (
-	metricsQueries   []string
-	metricsFormulas  []string
-	metricsInterval  int
-	metricsRaw       bool
-	metricsCloudCost bool
-	metricsSummary   bool
+	metricsQueries    []string
+	metricsFormulas   []string
+	metricsInterval   int
+	metricsRaw        bool
+	metricsCloudCost  bool
+	metricsSummary    bool
 	metricsNameFilter string
 	metricsTagFilter  string
 	metricsSubmitName string
@@ -316,6 +317,13 @@ var metricsSubmitCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, err := getClient(cmd)
 		if err != nil {
+			return err
+		}
+		if dryRun() {
+			fmt.Fprintf(cmd.OutOrStdout(), "--dry-run: would submit metric %q=%v, no data sent\n", metricsSubmitName, metricsSubmitVal)
+			return nil
+		}
+		if err := requireConfirm(fmt.Sprintf("submitting metric %q", metricsSubmitName)); err != nil {
 			return err
 		}
 
