@@ -406,7 +406,7 @@ func (p *parser) parseOneColumn() (Column, error) {
 	if t.kind == tkWord && strings.EqualFold(t.val, "DATE_TRUNC") {
 		p.next() // DATE_TRUNC
 		if p.peek().kind == tkLParen {
-			p.next() // (
+			p.next()             // (
 			unit := p.next().val // 'hour' etc
 			if p.peek().kind == tkComma {
 				p.next() // ,
@@ -628,7 +628,7 @@ func (p *parser) parseGroupBy() ([]string, error) {
 		if t.kind == tkWord && strings.EqualFold(t.val, "DATE_TRUNC") {
 			p.next() // DATE_TRUNC
 			if p.peek().kind == tkLParen {
-				p.next() // (
+				p.next()             // (
 				unit := p.next().val // 'hour'
 				if p.peek().kind == tkComma {
 					p.next()
