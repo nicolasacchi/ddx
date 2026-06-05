@@ -5,7 +5,7 @@ go 1.26.1
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/jedib0t/go-pretty/v6 v6.7.8
-	github.com/nicolasacchi/clicore v0.1.2
+	github.com/nicolasacchi/clicore v0.1.4
 	github.com/spf13/cobra v1.10.2
 	github.com/tidwall/gjson v1.18.0
 	golang.org/x/term v0.40.0
