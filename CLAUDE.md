@@ -487,8 +487,12 @@ JOIN, HAVING, subqueries, CTEs, DATE_TRUNC, window functions, multiple aggregate
 | 0 | Success |
 | 1 | API/network error |
 | 2 | Auth error (401/403) |
+| 3 | Validation (400) |
 | 4 | Not found (404) |
+| 5 | Rate limited (429) |
 | 6 | Write refused — confirmation required (`write_locked`); re-run with `--yes` |
+
+Fleet-canonical table (`clicore/cierrors.ExitCodeFor`).
 
 ## Architecture
 
