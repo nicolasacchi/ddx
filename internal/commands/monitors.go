@@ -137,6 +137,13 @@ var monitorsMuteCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if dryRun() {
+			fmt.Fprintf(cmd.OutOrStdout(), "--dry-run: would mute monitor %s, no changes made\n", args[0])
+			return nil
+		}
+		if err := requireConfirm(fmt.Sprintf("muting monitor %s", args[0])); err != nil {
+			return err
+		}
 		data, err := c.Post(context.Background(), "api/v1/monitor/"+args[0]+"/mute", nil)
 		if err != nil {
 			return err
@@ -169,6 +176,13 @@ var monitorsDeleteCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, err := getClient(cmd)
 		if err != nil {
+			return err
+		}
+		if dryRun() {
+			fmt.Fprintf(cmd.OutOrStdout(), "--dry-run: would delete monitor %s, no changes made\n", args[0])
+			return nil
+		}
+		if err := requireConfirm(fmt.Sprintf("deleting monitor %s", args[0])); err != nil {
 			return err
 		}
 		if err := c.Delete(context.Background(), "api/v1/monitor/"+args[0]); err != nil {

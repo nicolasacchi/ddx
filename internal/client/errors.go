@@ -8,9 +8,24 @@ type APIError struct {
 	Title      string
 	Detail     string
 	Hint       string
+
+	// Kind classifies client-side guard errors raised before a request
+	// (StatusCode stays 0). Currently: "write_locked" (confirm gate).
+	Kind string
 }
 
 func (e *APIError) Error() string {
+	// Client-side guard errors (no HTTP status) render from Detail/Hint.
+	if e.Kind != "" && e.StatusCode == 0 {
+		msg := e.Detail
+		if msg == "" {
+			msg = e.Kind
+		}
+		if e.Hint != "" {
+			return fmt.Sprintf("%s — %s", msg, e.Hint)
+		}
+		return msg
+	}
 	if e.Detail != "" {
 		return fmt.Sprintf("%d: %s", e.StatusCode, e.Detail)
 	}
@@ -22,6 +37,8 @@ func (e *APIError) Error() string {
 
 func (e *APIError) ExitCode() int {
 	switch {
+	case e.Kind == "write_locked":
+		return 6 // refused for safety, not failed — matches the otx/stx write-gate contract
 	case e.StatusCode == 401 || e.StatusCode == 403:
 		return 2
 	case e.StatusCode == 404:
