@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 
@@ -16,6 +17,8 @@ var (
 	hostsTag     string
 	hostsGroupBy string
 	hostsSortBy  string
+
+	irHostsListAll bool
 )
 
 func init() {
@@ -24,6 +27,7 @@ func init() {
 	hostsCmd.AddCommand(hostsQueryCmd)
 
 	hostsListCmd.Flags().StringVar(&hostsFilter, "filter", "", "Filter hosts by name (substring match)")
+	hostsListCmd.Flags().BoolVar(&irHostsListAll, "all", false, "Fetch every page (loops start/count pagination until total_matching is reached, capped at 20 pages)")
 
 	hostsQueryCmd.Flags().StringVar(&hostsTag, "tag", "", "Filter by tag (e.g., env:production, cluster_name:prod-apps-green)")
 	hostsQueryCmd.Flags().StringVar(&hostsGroupBy, "group-by", "", "Group results by field (e.g., instance_type, os)")
@@ -44,6 +48,30 @@ var hostsListCmd = &cobra.Command{
 			return err
 		}
 
+		if irHostsListAll {
+			const pageSize = 1000 // v1 hosts "count" max, per spec
+			fetch := func(offset, size int) ([]json.RawMessage, int, error) {
+				params := url.Values{}
+				if hostsFilter != "" {
+					params.Set("filter", hostsFilter)
+				}
+				params.Set("start", strconv.Itoa(offset))
+				params.Set("count", strconv.Itoa(size))
+				params.Set("include_muted_hosts_data", "true")
+				data, err := c.Get(context.Background(), "api/v1/hosts", params)
+				if err != nil {
+					return nil, 0, err
+				}
+				return irParseHostsPage(data)
+			}
+			items, _, err := paginateOffset(fetch, pageSize, 20)
+			if err != nil {
+				return err
+			}
+			out, _ := json.Marshal(items)
+			return printData("", out)
+		}
+
 		params := url.Values{}
 		if hostsFilter != "" {
 			params.Set("filter", hostsFilter)
@@ -56,15 +84,31 @@ var hostsListCmd = &cobra.Command{
 			return err
 		}
 
-		var resp struct {
-			HostList json.RawMessage `json:"host_list"`
+		hostList, total, perr := irParseHostsPage(data)
+		if perr != nil || hostList == nil {
+			return printData("", data)
 		}
-		if json.Unmarshal(data, &resp) == nil && resp.HostList != nil {
-			data = resp.HostList
+		if total > len(hostList) {
+			fmt.Fprintf(os.Stderr, "hosts.list: showing %d of %d (use --all to fetch every page)\n", len(hostList), total)
 		}
-
-		return printData("", data)
+		out, _ := json.Marshal(hostList)
+		return printData("", out)
 	},
+}
+
+// irParseHostsPage parses one page of a GET /api/v1/hosts response into the
+// host_list array plus total_matching (the "total items matching this
+// filter" count — separate from total_returned, which is just len(host_list)
+// for this page). Pure — no network — so it's directly unit-testable.
+func irParseHostsPage(raw json.RawMessage) ([]json.RawMessage, int, error) {
+	var resp struct {
+		HostList      []json.RawMessage `json:"host_list"`
+		TotalMatching int               `json:"total_matching"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, 0, fmt.Errorf("parse hosts response: %w", err)
+	}
+	return resp.HostList, resp.TotalMatching, nil
 }
 
 var hostsQueryCmd = &cobra.Command{
