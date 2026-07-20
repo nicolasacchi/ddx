@@ -76,6 +76,26 @@ func TestSplitQueriesTopLevel(t *testing.T) {
 			in:   nil,
 			want: nil,
 		},
+		{
+			name: "fully-quoted entry unwrapped (CSV escape-hatch back-compat)",
+			in:   []string{`"avg:m{a:1}"`},
+			want: []string{"avg:m{a:1}"},
+		},
+		{
+			name: "quoted entry with internal top-level-looking commas stays one entry and gets unwrapped",
+			in:   []string{`"avg:m{a:1,b:2}"`},
+			want: []string{"avg:m{a:1,b:2}"},
+		},
+		{
+			name: "outer double quotes stripped, inner quotes preserved",
+			in:   []string{`"anomalies(query0, 'basic', 2)"`},
+			want: []string{`anomalies(query0, 'basic', 2)`},
+		},
+		{
+			name: "lone unbalanced double quote left unchanged",
+			in:   []string{`"`},
+			want: []string{`"`},
+		},
 	}
 
 	for _, tc := range cases {

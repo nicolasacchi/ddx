@@ -2,6 +2,7 @@ package commands
 
 import (
 	"testing"
+	"time"
 )
 
 func TestIrBuildDowntimeCreateBodyRequiresScope(t *testing.T) {
@@ -170,5 +171,75 @@ func TestIrFormatDowntimeBoundaryRFC3339(t *testing.T) {
 func TestIrFormatDowntimeBoundaryInvalid(t *testing.T) {
 	if _, err := irFormatDowntimeBoundary("not-a-time"); err == nil {
 		t.Fatalf("expected error for unparseable boundary")
+	}
+}
+
+func TestIrFormatDowntimeBoundaryNowPassthrough(t *testing.T) {
+	before := time.Now().Add(-2 * time.Second)
+	got, err := irFormatDowntimeBoundary("now")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	parsed, err := time.Parse(time.RFC3339, got)
+	if err != nil {
+		t.Fatalf("result not RFC3339: %v", err)
+	}
+	after := time.Now().Add(2 * time.Second)
+	if parsed.Before(before) || parsed.After(after) {
+		t.Fatalf("\"now\" should resolve close to current time, got %v (window %v..%v)", parsed, before, after)
+	}
+}
+
+func TestIrFormatDowntimeBoundaryNowMinusPassthroughStaysInThePast(t *testing.T) {
+	// Explicit now-X forms must keep timeparse's existing past-anchored
+	// behavior — only bare durations flip to future-anchored.
+	got, err := irFormatDowntimeBoundary("now-2h")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	parsed, err := time.Parse(time.RFC3339, got)
+	if err != nil {
+		t.Fatalf("result not RFC3339: %v", err)
+	}
+	if !parsed.Before(time.Now()) {
+		t.Fatalf("now-2h should resolve to the past, got %v", parsed)
+	}
+}
+
+func TestIrFormatDowntimeBoundaryBareDurationIsFutureAnchored(t *testing.T) {
+	// Freeze by comparing relative ordering, not wall-clock: a bare duration
+	// must resolve well into the future, not now-2h (the timeparse default).
+	before := time.Now()
+	got, err := irFormatDowntimeBoundary("2h")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	parsed, err := time.Parse(time.RFC3339, got)
+	if err != nil {
+		t.Fatalf("result not RFC3339: %v", err)
+	}
+	if !parsed.After(before.Add(time.Hour)) {
+		t.Fatalf("bare duration \"2h\" should resolve to ~now+2h (future-anchored), got %v (before=%v)", parsed, before)
+	}
+}
+
+func TestIrValidateDowntimeWindow(t *testing.T) {
+	if err := irValidateDowntimeWindow("", ""); err != nil {
+		t.Fatalf("unexpected error for both empty: %v", err)
+	}
+	if err := irValidateDowntimeWindow("2026-07-20T09:00:00Z", ""); err != nil {
+		t.Fatalf("unexpected error for start-only: %v", err)
+	}
+	if err := irValidateDowntimeWindow("", "2026-07-20T09:00:00Z"); err != nil {
+		t.Fatalf("unexpected error for end-only: %v", err)
+	}
+	if err := irValidateDowntimeWindow("2026-07-20T09:00:00Z", "2026-07-20T11:00:00Z"); err != nil {
+		t.Fatalf("unexpected error for valid window: %v", err)
+	}
+	if err := irValidateDowntimeWindow("2026-07-20T11:00:00Z", "2026-07-20T09:00:00Z"); err == nil {
+		t.Fatalf("expected error when --end is before --start")
+	}
+	if err := irValidateDowntimeWindow("2026-07-20T09:00:00Z", "2026-07-20T09:00:00Z"); err == nil {
+		t.Fatalf("expected error when --end equals --start")
 	}
 }

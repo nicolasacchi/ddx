@@ -336,11 +336,12 @@ Examples:
 		if err != nil {
 			return err
 		}
+		if month == "" {
+			month = time.Now().UTC().Format("2006-01")
+		}
 
 		params := url.Values{}
-		if month != "" {
-			params.Set("month", month)
-		}
+		params.Set("month", month)
 		if usagecostTopMetricsNames != "" {
 			params.Set("names", usagecostTopMetricsNames)
 		}

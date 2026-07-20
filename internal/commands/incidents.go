@@ -570,19 +570,27 @@ func irBuildIncidentCreateBody(title, severity, summary string, impacted bool, i
 // 8 ("slug == public_id") and resolveIncidentUUID's numeric-id round trip
 // above. Returns empty strings for any field genuinely absent from the
 // response rather than guessing.
+//
+// public_id decodes as json.Number rather than string: the API returns it as
+// a JSON integer (e.g. 45), and json.Number's literal-store handling accepts
+// both a bare number and a quoted numeric string, so either shape decodes
+// without error. The Unmarshal error is deliberately ignored rather than
+// discarding every field on any failure: Go's decoder still populates
+// sibling fields it could decode even when one field's JSON type doesn't
+// match, so a single unexpected field (or a genuinely absent one) shouldn't
+// blank out identifiers that did decode. Only a fully malformed payload
+// (not valid JSON at all) leaves every field at its zero value.
 func irExtractIncidentIdentity(raw json.RawMessage) (uuid, publicID, slug, title string) {
 	var wrapper struct {
 		Data struct {
 			ID         string `json:"id"`
 			Attributes struct {
-				Title    string `json:"title"`
-				PublicID string `json:"public_id"`
-				Slug     string `json:"slug"`
+				Title    string      `json:"title"`
+				PublicID json.Number `json:"public_id"`
+				Slug     string      `json:"slug"`
 			} `json:"attributes"`
 		} `json:"data"`
 	}
-	if json.Unmarshal(raw, &wrapper) != nil {
-		return "", "", "", ""
-	}
-	return wrapper.Data.ID, wrapper.Data.Attributes.PublicID, wrapper.Data.Attributes.Slug, wrapper.Data.Attributes.Title
+	_ = json.Unmarshal(raw, &wrapper)
+	return wrapper.Data.ID, wrapper.Data.Attributes.PublicID.String(), wrapper.Data.Attributes.Slug, wrapper.Data.Attributes.Title
 }

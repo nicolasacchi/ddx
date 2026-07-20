@@ -108,13 +108,15 @@ func TestIrBuildIncidentCreateBodyValidatesSeverity(t *testing.T) {
 }
 
 func TestIrExtractIncidentIdentity(t *testing.T) {
+	// Realistic shape: the API returns public_id as a JSON integer, not a
+	// quoted string.
 	raw := json.RawMessage(`{
 		"data": {
 			"id": "00000000-0000-0000-1234-000000000000",
 			"type": "incidents",
 			"attributes": {
 				"title": "A test incident title",
-				"public_id": "45",
+				"public_id": 45,
 				"slug": "IR-45"
 			}
 		}
@@ -132,6 +134,50 @@ func TestIrExtractIncidentIdentity(t *testing.T) {
 	}
 	if title != "A test incident title" {
 		t.Fatalf("title = %q", title)
+	}
+}
+
+func TestIrExtractIncidentIdentityStringPublicIDStillDecodes(t *testing.T) {
+	// Back-compat: a quoted numeric string for public_id must still decode
+	// (json.Number accepts either shape).
+	raw := json.RawMessage(`{
+		"data": {
+			"id": "00000000-0000-0000-1234-000000000000",
+			"attributes": {"title": "t", "public_id": "45", "slug": "IR-45"}
+		}
+	}`)
+	_, publicID, slug, _ := irExtractIncidentIdentity(raw)
+	if publicID != "45" {
+		t.Fatalf("publicID = %q, want 45", publicID)
+	}
+	if slug != "IR-45" {
+		t.Fatalf("slug = %q, want IR-45", slug)
+	}
+}
+
+func TestIrExtractIncidentIdentityMixedTypesPartialDecodeTolerant(t *testing.T) {
+	// Mixed case: integer public_id alongside a string slug, plus a
+	// deliberately wrong-typed title (number instead of string). Go's
+	// decoder records that mismatch as an error but still populates sibling
+	// fields it could decode — irExtractIncidentIdentity must return the
+	// public_id/slug it did decode instead of discarding everything the
+	// moment Unmarshal reports any error.
+	raw := json.RawMessage(`{
+		"data": {
+			"id": "00000000-0000-0000-1234-000000000000",
+			"attributes": {"title": 12345, "public_id": 45, "slug": "IR-45"}
+		}
+	}`)
+
+	uuid, publicID, slug, _ := irExtractIncidentIdentity(raw)
+	if uuid != "00000000-0000-0000-1234-000000000000" {
+		t.Fatalf("uuid = %q", uuid)
+	}
+	if publicID != "45" {
+		t.Fatalf("publicID = %q, want 45", publicID)
+	}
+	if slug != "IR-45" {
+		t.Fatalf("slug = %q, want IR-45", slug)
 	}
 }
 

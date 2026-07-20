@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,8 +31,8 @@ func init() {
 	irDowntimesCreateCmd.Flags().StringVar(&irDowntimeScope, "scope", "", "Scope the downtime applies to, e.g. \"env:(staging OR prod) AND datacenter:us-east-1\" (required)")
 	irDowntimesCreateCmd.Flags().Int64Var(&irDowntimeMonitorID, "monitor-id", 0, "Mute only this monitor id (mutually exclusive with --monitor-tags)")
 	irDowntimesCreateCmd.Flags().StringVar(&irDowntimeMonitorTags, "monitor-tags", "", "Comma-separated monitor tags to mute (mutually exclusive with --monitor-id); omit both to mute all monitors in scope")
-	irDowntimesCreateCmd.Flags().StringVar(&irDowntimeStart, "start", "", "Downtime start (timeparse form: 1h, RFC3339, now, ...); omitted = starts immediately")
-	irDowntimesCreateCmd.Flags().StringVar(&irDowntimeEnd, "end", "", "Downtime end (timeparse form); omitted = never ends")
+	irDowntimesCreateCmd.Flags().StringVar(&irDowntimeStart, "start", "", "Downtime start: RFC3339, now, now-1h, epoch, or a bare duration like 2h — bare durations are future-anchored (2h = two hours from now, not two hours ago); omitted = starts immediately")
+	irDowntimesCreateCmd.Flags().StringVar(&irDowntimeEnd, "end", "", "Downtime end (same forms as --start; bare durations are future-anchored, e.g. --end 2h = two hours from now); omitted = never ends")
 	irDowntimesCreateCmd.Flags().StringVar(&irDowntimeMessage, "message", "", "Message to include with downtime notifications")
 	irDowntimesCreateCmd.MarkFlagRequired("scope")
 }
@@ -107,6 +108,12 @@ var irDowntimesCreateCmd = &cobra.Command{
 supported (no recurrence modeling) — pass --start/--end for a fixed window, or
 omit both for a downtime that starts immediately and never ends.
 
+--start/--end accept RFC3339, "now", "now-1h"/"now+1h", epoch seconds, or a
+bare duration like "2h" — bare durations are future-anchored (2h = two hours
+from now), matching how a maintenance window is normally described ("starts
+now, lasts 2h"), not timeparse's usual now-X lookback convention. When both
+resolve, --end must be strictly after --start.
+
 Examples:
   ddx downtimes create --scope "env:prod" --monitor-tags "service:checkout" --message "Deploy window" --yes
   ddx downtimes create --scope "env:staging" --monitor-id 123 --start now --end 2h --yes
@@ -124,6 +131,9 @@ Examples:
 		endTS, err := irFormatDowntimeBoundary(irDowntimeEnd)
 		if err != nil {
 			return fmt.Errorf("--end: %w", err)
+		}
+		if err := irValidateDowntimeWindow(startTS, endTS); err != nil {
+			return err
 		}
 
 		body, err := irBuildDowntimeCreateBody(irDowntimeScope, cmd.Flags().Changed("monitor-id"), irDowntimeMonitorID, irDowntimeMonitorTags, startTS, endTS, irDowntimeMessage)
@@ -164,15 +174,77 @@ Examples:
 // attributes expect. Empty input passes through unchanged — omitting a
 // schedule boundary is meaningful (start defaults to "now", end defaults to
 // "never").
+//
+// timeparse.Parse anchors bare durations ("2h") in the past (now-2h) — it's
+// built for --from/--to lookback windows. A maintenance window described as
+// "--start now --end 2h" means the opposite: end should be two hours in the
+// FUTURE, not before start. So bare durations get a dedicated future-anchored
+// (now+duration) interpretation here; every other form ("now", RFC3339, epoch,
+// explicit now-X/now+X) passes straight through to timeparse.Parse unchanged.
 func irFormatDowntimeBoundary(value string) (string, error) {
 	if value == "" {
 		return "", nil
+	}
+	if irIsBareDuration(value) {
+		dur, err := timeparse.ParseDuration(value)
+		if err != nil {
+			return "", err
+		}
+		return time.Now().Add(dur).UTC().Format(time.RFC3339), nil
 	}
 	sec, err := timeparse.Parse(value)
 	if err != nil {
 		return "", err
 	}
 	return time.Unix(sec, 0).UTC().Format(time.RFC3339), nil
+}
+
+// irIsBareDuration reports whether value is a plain duration (e.g. "2h",
+// "30m", "1.5d") with no "now"/"now-"/"now+" prefix and that isn't RFC3339 or
+// a Unix timestamp — i.e. exactly the form timeparse.Parse's "pure relative"
+// branch treats as now-duration (a past anchor), which downtimes create
+// instead future-anchors. "now", "now-X", "now+X", RFC3339, and epoch forms
+// are excluded here so they keep going through timeparse.Parse unchanged.
+func irIsBareDuration(value string) bool {
+	if value == "" || value == "now" {
+		return false
+	}
+	if strings.HasPrefix(value, "now-") || strings.HasPrefix(value, "now+") {
+		return false
+	}
+	if _, err := time.Parse(time.RFC3339, value); err == nil {
+		return false
+	}
+	if _, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return false
+	}
+	_, err := timeparse.ParseDuration(value)
+	return err == nil
+}
+
+// irValidateDowntimeWindow rejects a downtime schedule whose end boundary
+// does not strictly follow its start boundary. startTS/endTS are the
+// pre-formatted RFC3339 strings irFormatDowntimeBoundary returns (or "" when
+// that boundary was omitted) — validation only applies when both are
+// present, since a single open-ended boundary has no ordering to violate.
+// Called before dryRun()/requireConfirm() so even a --dry-run preview catches
+// an inverted window.
+func irValidateDowntimeWindow(startTS, endTS string) error {
+	if startTS == "" || endTS == "" {
+		return nil
+	}
+	startT, err := time.Parse(time.RFC3339, startTS)
+	if err != nil {
+		return fmt.Errorf("parse --start: %w", err)
+	}
+	endT, err := time.Parse(time.RFC3339, endTS)
+	if err != nil {
+		return fmt.Errorf("parse --end: %w", err)
+	}
+	if !endT.After(startT) {
+		return fmt.Errorf("--end (%s) must be after --start (%s)", endTS, startTS)
+	}
+	return nil
 }
 
 // irBuildDowntimeCreateBody builds the POST /api/v2/downtime request body.

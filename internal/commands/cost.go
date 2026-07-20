@@ -3,7 +3,6 @@ package commands
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
@@ -40,8 +39,7 @@ func init() {
 	costQueryCmd.Flags().StringArrayVar(&costFormulas, "formulas", nil, "Formula expressions (e.g. \"top(query0, 5, 'mean', 'desc')\")")
 	costQueryCmd.MarkFlagRequired("queries")
 
-	costAttributionCmd.Flags().StringVar(&usagecostAttrMonth, "month", "", "ISO month YYYY-MM (or RFC3339): start_month, and end_month unless --end-month overrides it (required)")
-	costAttributionCmd.MarkFlagRequired("month")
+	costAttributionCmd.Flags().StringVar(&usagecostAttrMonth, "month", "", "ISO month YYYY-MM (or RFC3339): start_month, and end_month unless --end-month overrides it; defaults to the current month")
 	costAttributionCmd.Flags().StringVar(&usagecostAttrEndMonth, "end-month", "", "ISO month YYYY-MM (or RFC3339) to end the range at; defaults to --month (single-month query)")
 	costAttributionCmd.Flags().StringVar(&usagecostAttrFields, "fields", "*", `Comma-separated cost fields, e.g. "infra_host_on_demand_cost,infra_host_percentage_in_account"; "*" retrieves all (default)`)
 	costAttributionCmd.Flags().StringVar(&costTags, "tags", "", "Comma-separated tag keys to break cost down by (tag_breakdown_keys)")
@@ -132,6 +130,7 @@ Auto-paginates via meta.pagination.next_record_id, capped at 10 pages, with a
 guidance for this endpoint's pagination.
 
 Examples:
+  ddx cost attribution
   ddx cost attribution --month 2026-06
   ddx cost attribution --month 2026-01 --end-month 2026-06 --fields "infra_host_on_demand_cost,infra_host_percentage_in_account"
   ddx cost attribution --month 2026-06 --tags team,env --sort-name infra_host --sort-direction desc`,
@@ -146,7 +145,7 @@ Examples:
 			return err
 		}
 		if startMonth == "" {
-			return fmt.Errorf("--month is required")
+			startMonth = time.Now().UTC().Format("2006-01")
 		}
 		endMonth := startMonth
 		if usagecostAttrEndMonth != "" {

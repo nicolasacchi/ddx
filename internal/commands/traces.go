@@ -340,10 +340,13 @@ Examples:
 // tracesscalarSpan is one entry of TraceDataAttributes.spans
 // (components.schemas.APMTraceSpan in openapi-v2.yaml). Required fields
 // per the spec: service, name, resource, traceID, spanID, parentID.
+// SpanID/ParentID/TraceID are uint64, not int64: the spec's own example
+// value (9876543210987654321) exceeds math.MaxInt64, and an int64 field
+// hard-fails json.Unmarshal on such a span instead of just misreading it.
 type tracesscalarSpan struct {
-	SpanID      int64              `json:"spanID"`
-	ParentID    int64              `json:"parentID"`
-	TraceID     int64              `json:"traceID"`
+	SpanID      uint64             `json:"spanID"`
+	ParentID    uint64             `json:"parentID"`
+	TraceID     uint64             `json:"traceID"`
 	TraceIDFull string             `json:"traceIDFull"`
 	Name        string             `json:"name"`
 	Resource    string             `json:"resource"`
@@ -386,7 +389,7 @@ type tracesscalarSpanNode struct {
 // start time. Pure — no I/O — unit-tested against a fabricated span set
 // (root, nested children, orphan).
 func tracesscalarBuildSpanTree(spans []tracesscalarSpan) *tracesscalarSpanNode {
-	byID := make(map[int64]*tracesscalarSpanNode, len(spans))
+	byID := make(map[uint64]*tracesscalarSpanNode, len(spans))
 	for i := range spans {
 		byID[spans[i].SpanID] = &tracesscalarSpanNode{Span: spans[i]}
 	}

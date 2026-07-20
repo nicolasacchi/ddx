@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -255,7 +256,7 @@ func TestTracesscalarSpanToMap(t *testing.T) {
 	}
 	m := tracesscalarSpanToMap(sp)
 
-	if m["spanID"] != int64(7) || m["service"] != "web" || m["error"] != 1 {
+	if m["spanID"] != uint64(7) || m["service"] != "web" || m["error"] != 1 {
 		t.Fatalf("tracesscalarSpanToMap() = %#v, missing/wrong core fields", m)
 	}
 	if m["duration_ms"] != 100.0 {
@@ -264,5 +265,38 @@ func TestTracesscalarSpanToMap(t *testing.T) {
 	meta, ok := m["meta"].(map[string]string)
 	if !ok || meta["env"] != "production" {
 		t.Fatalf("meta = %#v, want {env: production}", m["meta"])
+	}
+}
+
+func TestTracesscalarSpanUnmarshalsOversizedUint64SpanID(t *testing.T) {
+	// Regression: 9876543210987654321 exceeds math.MaxInt64
+	// (9223372036854775807, the spec's own example value) — a real span with
+	// an ID that large used to hard-fail json.Unmarshal when the field was
+	// declared int64 instead of uint64.
+	raw := []byte(`{"spanID": 9876543210987654321, "parentID": 1, "traceID": 42, "service": "web"}`)
+	var sp tracesscalarSpan
+	if err := json.Unmarshal(raw, &sp); err != nil {
+		t.Fatalf("unmarshal oversized spanID: %v", err)
+	}
+	if sp.SpanID != 9876543210987654321 {
+		t.Fatalf("SpanID = %d, want 9876543210987654321", sp.SpanID)
+	}
+}
+
+func TestTracesscalarBuildSpanTreeWithOversizedSpanID(t *testing.T) {
+	spans := []tracesscalarSpan{
+		{SpanID: 1, ParentID: 0, TraceID: 42, Service: "web"},
+		{SpanID: 9876543210987654321, ParentID: 1, TraceID: 42, Service: "downstream"},
+	}
+	root := tracesscalarBuildSpanTree(spans)
+	if len(root.Children) != 1 {
+		t.Fatalf("root has %d children, want 1", len(root.Children))
+	}
+	a := root.Children[0]
+	if a.Span.SpanID != 1 {
+		t.Fatalf("root child SpanID = %d, want 1", a.Span.SpanID)
+	}
+	if len(a.Children) != 1 || a.Children[0].Span.SpanID != 9876543210987654321 {
+		t.Fatalf("A.Children = %#v, want single child with oversized spanID", a.Children)
 	}
 }

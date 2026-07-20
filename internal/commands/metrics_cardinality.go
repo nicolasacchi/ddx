@@ -388,7 +388,9 @@ var cardinalityTagRulesListCmd = &cobra.Command{
 		}
 
 		params := url.Values{}
-		params.Set("page[limit]", strconv.Itoa(limitFlag))
+		if limitFlag > 0 {
+			params.Set("page[limit]", strconv.Itoa(limitFlag))
+		}
 		if cardinalityRuleListOffset > 0 {
 			params.Set("page[offset]", strconv.Itoa(cardinalityRuleListOffset))
 		}

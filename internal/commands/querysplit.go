@@ -29,7 +29,9 @@ func splitQueriesTopLevel(vals []string) []string {
 // counter" is sufficient here, since we only need to know "are we inside
 // some bracketed group", not which kind). Quotes toggle a separate state so
 // commas inside quoted strings are never treated as separators, regardless of
-// bracket depth.
+// bracket depth. Each resulting part then has one matching outer pair of
+// double quotes stripped, if present (see helpersUnwrapOuterQuotes) — the
+// CSV-escape-hatch back-compat this restores.
 func helpersSplitTopLevel(s string) []string {
 	var out []string
 	depth := 0
@@ -52,15 +54,32 @@ func helpersSplitTopLevel(s string) []string {
 			}
 		case r == ',' && depth == 0:
 			if part := strings.TrimSpace(s[start:i]); part != "" {
-				out = append(out, part)
+				out = append(out, helpersUnwrapOuterQuotes(part))
 			}
 			start = i + 1
 		}
 	}
 
 	if part := strings.TrimSpace(s[start:]); part != "" {
-		out = append(out, part)
+		out = append(out, helpersUnwrapOuterQuotes(part))
 	}
 
 	return out
+}
+
+// helpersUnwrapOuterQuotes strips one matching outer pair of double quotes
+// from s, leaving any inner quotes untouched. Restores a back-compat escape
+// hatch: on main, --queries/--formulas used StringSliceVar (CSV parsing),
+// which stripped double quotes for you, so callers could shield a query's own
+// top-level commas with e.g. --queries '"avg:m{a:1,b:2}"'. StringArrayVar +
+// splitQueriesTopLevel already protects those commas via bracket/quote
+// tracking without needing the quotes at all, but passes whole flag values
+// through verbatim — so without this, quotes used out of habit (or copied
+// from an old example) would reach the Datadog API and 400. A lone
+// unbalanced quote (length 1) has no pair to strip and is left alone.
+func helpersUnwrapOuterQuotes(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
 }

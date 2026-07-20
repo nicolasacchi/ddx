@@ -47,7 +47,7 @@ func init() {
 	metricsCmd.AddCommand(metricsSubmitCmd)
 
 	metricsQueryCmd.Flags().StringArrayVar(&metricsQueries, "queries", nil, "Metric queries (repeatable, e.g. --queries \"avg:a{*}\" --queries \"avg:b{*}\"; a single value may also comma-join multiple queries — split happens outside {}/()/quotes, so \"avg:a{x:1,y:2},avg:b{*}\" works)")
-	metricsQueryCmd.Flags().StringSliceVar(&metricsFormulas, "formulas", nil, "Formula expressions (e.g., \"anomalies(query0, \\\"basic\\\", 2)\")")
+	metricsQueryCmd.Flags().StringArrayVar(&metricsFormulas, "formulas", nil, "Formula expressions (repeatable, e.g. --formulas \"query0 + query1\"; a single value may also comma-join multiple formulas — split happens outside {}/()/quotes, so \"anomalies(query0, \\\"basic\\\", 2)\" with an internal comma works)")
 	metricsQueryCmd.Flags().StringVar(&metricsInterval, "interval", "", "Time bucket interval: milliseconds (e.g. 300000, back-compat), a Go duration (e.g. 90s, 1h30m), or day/week suffix (e.g. 1d, 2w)")
 	metricsQueryCmd.Flags().BoolVar(&metricsRaw, "raw", false, "Return raw CSV data instead of binned stats")
 	metricsQueryCmd.Flags().BoolVar(&metricsCloudCost, "cloud-cost", false, "Query Cloud Cost Management data")
@@ -154,9 +154,10 @@ Examples:
 
 		attrs := body["data"].(map[string]any)["attributes"].(map[string]any)
 
-		if len(metricsFormulas) > 0 {
-			formulas := make([]map[string]any, len(metricsFormulas))
-			for i, f := range metricsFormulas {
+		formulaStrs := splitQueriesTopLevel(metricsFormulas)
+		if len(formulaStrs) > 0 {
+			formulas := make([]map[string]any, len(formulaStrs))
+			for i, f := range formulaStrs {
 				formulas[i] = map[string]any{"formula": f}
 			}
 			attrs["formulas"] = formulas
