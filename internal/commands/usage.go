@@ -148,6 +148,9 @@ Examples:
 			return err
 		}
 		usagecostReportCount("usage hourly", len(items))
+		if len(items) == 0 {
+			fmt.Fprintln(os.Stderr, "no records - hourly usage data lags up to several days; widen --from (e.g. --from 96h)")
+		}
 		return printData("usage.hourly", out)
 	},
 }
@@ -158,10 +161,13 @@ var usagecostEstimatedCmd = &cobra.Command{
 	Long: `Get estimated cost across your account (api/v2/usage/estimated_cost).
 
 Estimated cost is only available for the CURRENT and PREVIOUS month, and is
-delayed up to 72 hours from when it was incurred. Live-probed on this org
-2026-07-20: --month 2026-06 returned an empty {"data":[]} while the bare
-default (current month) returned data. For anything older, use
-"ddx usage historical" instead.
+delayed up to 72 hours from when it was incurred. The API requires exactly
+one of start_month/start_date on every request (live-probed 2026-07-20: a
+bare request with neither returns a 400 "Must provide exactly one of
+start_month or start_date"), so when --month is omitted this defaults to the
+current UTC month. --month 2026-06 was separately observed to return an
+empty {"data":[]} on this org. For anything older, use "ddx usage historical"
+instead.
 
 Examples:
   ddx usage estimated
@@ -176,11 +182,12 @@ Examples:
 		if err != nil {
 			return err
 		}
+		if month == "" {
+			month = time.Now().UTC().Format("2006-01")
+		}
 
 		params := url.Values{}
-		if month != "" {
-			params.Set("start_month", month)
-		}
+		params.Set("start_month", month)
 		if usagecostEstimatedView != "" {
 			params.Set("view", usagecostEstimatedView)
 		}

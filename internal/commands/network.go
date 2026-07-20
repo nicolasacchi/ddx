@@ -2,9 +2,12 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"strconv"
+	"strings"
 
+	"github.com/nicolasacchi/ddx/internal/client"
 	"github.com/spf13/cobra"
 )
 
@@ -68,6 +71,10 @@ var networkConnectionsCmd = &cobra.Command{
 	Short: "Aggregated network connections (Cloud Network Monitoring)",
 	Long: `Get aggregated network connections (GET api/v2/network/connections/aggregate).
 
+Requires Cloud Network Monitoring (CNM) to be enabled on the org. When CNM
+isn't enabled, Datadog returns a bare 400 "Bad Request" here (not 403) even
+for an otherwise spec-valid request — live-probed 2026-07-20 (EU org).
+
 Examples:
   ddx network connections --from 1h
   ddx network connections --group-by client_service,server_service --from 4h
@@ -89,7 +96,7 @@ Examples:
 		params := driftBuildNetworkAggregateParams(from, to, driftNetConnGroupBy, driftNetConnTags, driftNetConnQuery, driftNetConnLimit)
 		data, err := c.Get(context.Background(), "api/v2/network/connections/aggregate", params)
 		if err != nil {
-			return err
+			return driftAnnotateCNMHint(err)
 		}
 		return printData("network.connections", flattenV2Items(extractData(data)))
 	},
@@ -99,6 +106,10 @@ var networkDNSCmd = &cobra.Command{
 	Use:   "dns",
 	Short: "Aggregated DNS traffic (Cloud Network Monitoring)",
 	Long: `Get aggregated DNS traffic (GET api/v2/network/dns/aggregate).
+
+Requires Cloud Network Monitoring (CNM) to be enabled on the org. When CNM
+isn't enabled, Datadog returns a bare 400 "Bad Request" here (not 403) even
+for an otherwise spec-valid request — live-probed 2026-07-20 (EU org).
 
 Examples:
   ddx network dns --from 1h
@@ -121,7 +132,7 @@ Examples:
 		params := driftBuildNetworkAggregateParams(from, to, driftNetDNSGroupBy, driftNetDNSTags, driftNetDNSQuery, driftNetDNSLimit)
 		data, err := c.Get(context.Background(), "api/v2/network/dns/aggregate", params)
 		if err != nil {
-			return err
+			return driftAnnotateCNMHint(err)
 		}
 		return printData("network.dns", flattenV2Items(extractData(data)))
 	},
@@ -147,4 +158,17 @@ func driftBuildNetworkAggregateParams(from, to int64, groupBy, tags, query strin
 		params.Set("limit", strconv.Itoa(limit))
 	}
 	return params
+}
+
+// driftAnnotateCNMHint sets a Hint on a bare "400: Bad Request" response from
+// the network aggregate endpoints. Datadog returns exactly this — no further
+// detail, and 400 rather than 403 — when Cloud Network Monitoring isn't
+// enabled on the org, even for an otherwise spec-valid request (live-probed
+// 2026-07-20, EU org, via bare curl). Leaves any other error untouched.
+func driftAnnotateCNMHint(err error) error {
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == 400 && strings.EqualFold(strings.TrimSpace(apiErr.Detail), "Bad Request") {
+		apiErr.Hint = "Cloud Network Monitoring (CNM) may not be enabled on this org — Datadog returns a bare 400 here when it isn't"
+	}
+	return err
 }
