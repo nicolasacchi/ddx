@@ -221,6 +221,99 @@ func TestProfilerExtractWindowMeta(t *testing.T) {
 	}
 }
 
+// buildDegenerateFlameGraphRaw assembles a raw aggregate response whose
+// flame graph node is a 3-element array (missing the trailing children
+// array) instead of the documented 4-element [frame, value, gini, children]
+// shape. This is what Datadog returns when profiles_in_window is 0 (nothing
+// matched the query, e.g. continuous profiling disabled) — parseFlameNode
+// correctly rejects it, so callers must short-circuit before reaching it.
+func buildDegenerateFlameGraphRaw(t *testing.T) json.RawMessage {
+	t.Helper()
+	degenerateNode, err := json.Marshal([]any{0, 0.0, 0.0})
+	if err != nil {
+		t.Fatalf("marshal degenerate flame graph node: %v", err)
+	}
+	resp := struct {
+		FlameGraph  json.RawMessage `json:"flameGraph"`
+		Frames      [][]int         `json:"frames"`
+		Strings     []string        `json:"strings"`
+		FrameSchema []string        `json:"frameSchema"`
+	}{
+		FlameGraph:  degenerateNode,
+		Frames:      [][]int{},
+		Strings:     []string{},
+		FrameSchema: []string{},
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal test aggregate response: %v", err)
+	}
+	return raw
+}
+
+func TestProfilerSafeFunctionTotals(t *testing.T) {
+	raw := buildDegenerateFlameGraphRaw(t)
+
+	t.Run("profiles_in_window is 0: short-circuits to an empty, error-free result", func(t *testing.T) {
+		entries, err := profilerSafeFunctionTotals(raw, 0)
+		if err != nil {
+			t.Fatalf("profilerSafeFunctionTotals with profilesInWindow=0 = error %v, want nil (should never reach the degenerate flame graph)", err)
+		}
+		if entries == nil || len(entries) != 0 {
+			t.Fatalf("profilerSafeFunctionTotals with profilesInWindow=0 = %#v, want an empty (non-nil) slice", entries)
+		}
+	})
+
+	t.Run("profiles_in_window > 0: does NOT loosen the malformed-node check, still errors", func(t *testing.T) {
+		if _, err := profilerSafeFunctionTotals(raw, 5); err == nil {
+			t.Fatal("expected an error for a genuinely malformed (3-element) flame graph node when profiles were actually in the window — the 4-element contract must still be enforced")
+		}
+	})
+
+	t.Run("profiles_in_window > 0 with a well-formed graph still decodes normally", func(t *testing.T) {
+		wellFormed := buildTestAggregateRaw(t)
+		entries, err := profilerSafeFunctionTotals(wellFormed, 1)
+		if err != nil {
+			t.Fatalf("profilerSafeFunctionTotals with a well-formed graph: %v", err)
+		}
+		if len(entries) != 2 {
+			t.Fatalf("expected the normal decode path (2 merged entries), got %d: %#v", len(entries), entries)
+		}
+	})
+}
+
+func TestProfilerEmptyFunctionViewOutput(t *testing.T) {
+	meta := profilerWindowMeta{
+		ProfilesAggregated: 0,
+		ProfilesInWindow:   0,
+		Metadata:           json.RawMessage(`{"service":"web-1000farmacie"}`),
+	}
+	out := profilerEmptyFunctionViewOutput("cpu-time", meta)
+
+	if out["profile_type"] != "cpu-time" {
+		t.Errorf("profile_type = %v, want cpu-time", out["profile_type"])
+	}
+	if out["profiles_in_window"] != 0 {
+		t.Errorf("profiles_in_window = %v, want 0", out["profiles_in_window"])
+	}
+	if out["profiles_aggregated"] != 0 {
+		t.Errorf("profiles_aggregated = %v, want 0", out["profiles_aggregated"])
+	}
+	top, ok := out["top"].([]any)
+	if !ok {
+		t.Fatalf("top has unexpected type %T, want []any", out["top"])
+	}
+	if len(top) != 0 {
+		t.Errorf("top = %#v, want an empty slice", top)
+	}
+	if out["total"] != 0 {
+		t.Errorf("total = %v, want 0", out["total"])
+	}
+	if _, err := json.Marshal(out); err != nil {
+		t.Fatalf("profilerEmptyFunctionViewOutput result is not marshalable: %v", err)
+	}
+}
+
 func TestProfilerBuildFunctionDiff(t *testing.T) {
 	before := []profilerFunctionEntry{
 		{Function: "grew", File: "a.rb", Value: 100},

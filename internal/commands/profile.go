@@ -264,7 +264,7 @@ Examples:
 		case "endpoint":
 			return printProfileEndpointView(raw, profileType, profileTopN)
 		case "function":
-			return printProfileFunctionView(raw, profileType, profileTopN)
+			return profilerPrintFunctionView(raw, profileType, profileTopN)
 		case "summary":
 			return printProfileSummaryView(raw)
 		}
@@ -420,11 +420,11 @@ Examples:
 		var out map[string]any
 		switch profileBy {
 		case "function":
-			beforeFns, err := profilerExtractFunctionTotals(beforeRaw)
+			beforeFns, err := profilerSafeFunctionTotals(beforeRaw, beforeWindow.ProfilesInWindow)
 			if err != nil {
 				return fmt.Errorf("before parse: %w", err)
 			}
-			afterFns, err := profilerExtractFunctionTotals(afterRaw)
+			afterFns, err := profilerSafeFunctionTotals(afterRaw, afterWindow.ProfilesInWindow)
 			if err != nil {
 				return fmt.Errorf("after parse: %w", err)
 			}
@@ -520,7 +520,7 @@ Examples:
 			if err != nil {
 				return err
 			}
-			return printProfileFunctionView(raw, profileType, profileTopN)
+			return profilerPrintFunctionView(raw, profileType, profileTopN)
 		case "summary":
 			raw, err := callSingleProfileAggregate(c, defaultProfileType)
 			if err != nil {
@@ -1028,6 +1028,58 @@ func profilerExtractFunctionTotals(raw json.RawMessage) ([]profilerFunctionEntry
 		entries = append(entries, *byKey[key])
 	}
 	return entries, nil
+}
+
+// profilerSafeFunctionTotals wraps profilerExtractFunctionTotals with a
+// short-circuit for empty result windows. When profilesInWindow is 0 (no
+// profiles matched the query — e.g. continuous profiling is disabled, or
+// the query/time-range is simply too narrow), the aggregate API returns a
+// degenerate flame graph whose node arrays have 3 elements instead of the
+// documented 4, which parseFlameNode correctly rejects as malformed. Rather
+// than loosen that check — a genuinely malformed 4-element contract should
+// still error — we just never hand it a response with nothing to aggregate
+// in the first place, and return an empty slice instead.
+func profilerSafeFunctionTotals(raw json.RawMessage, profilesInWindow int) ([]profilerFunctionEntry, error) {
+	if profilesInWindow == 0 {
+		return []profilerFunctionEntry{}, nil
+	}
+	return profilerExtractFunctionTotals(raw)
+}
+
+// profilerEmptyFunctionViewOutput builds the standard `--by function` output
+// shape with an empty top-N list, for when there are zero profiles in the
+// window to aggregate.
+func profilerEmptyFunctionViewOutput(profType string, meta profilerWindowMeta) map[string]any {
+	return map[string]any{
+		"profile_type":        profType,
+		"profiles_aggregated": meta.ProfilesAggregated,
+		"profiles_in_window":  meta.ProfilesInWindow,
+		"unique_leaf_frames":  0,
+		"total":               0,
+		"top":                 []any{},
+		"metadata":            meta.Metadata,
+	}
+}
+
+// profilerPrintFunctionView wraps printProfileFunctionView (profile_decode.go)
+// with the same zero-window short-circuit as profilerSafeFunctionTotals: when
+// profiles_in_window is 0, print the standard-shaped empty result plus a
+// clear stderr note instead of handing the degenerate flame graph to
+// parseFlameNode, which would otherwise hard-error.
+func profilerPrintFunctionView(raw json.RawMessage, profType string, topN int) error {
+	meta, err := profilerExtractWindowMeta(raw)
+	if err != nil {
+		return fmt.Errorf("parse aggregate response: %w", err)
+	}
+	if meta.ProfilesInWindow == 0 {
+		fmt.Fprintln(os.Stderr, "note: 0 profiles in window — nothing to aggregate (is continuous profiling enabled?)")
+		jsonBytes, err := json.Marshal(profilerEmptyFunctionViewOutput(profType, meta))
+		if err != nil {
+			return err
+		}
+		return printData("", jsonBytes)
+	}
+	return printProfileFunctionView(raw, profType, topN)
 }
 
 // profilerFunctionDiffRow is one row in the function-diff table — the
