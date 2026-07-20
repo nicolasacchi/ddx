@@ -39,7 +39,7 @@ func init() {
 	costQueryCmd.Flags().StringArrayVar(&costFormulas, "formulas", nil, "Formula expressions (e.g. \"top(query0, 5, 'mean', 'desc')\")")
 	costQueryCmd.MarkFlagRequired("queries")
 
-	costAttributionCmd.Flags().StringVar(&usagecostAttrMonth, "month", "", "ISO month YYYY-MM (or RFC3339): start_month, and end_month unless --end-month overrides it; defaults to the current month")
+	costAttributionCmd.Flags().StringVar(&usagecostAttrMonth, "month", "", "ISO month YYYY-MM (or RFC3339): start_month, and end_month unless --end-month overrides it; defaults to the previous month (the newest month with published attribution data)")
 	costAttributionCmd.Flags().StringVar(&usagecostAttrEndMonth, "end-month", "", "ISO month YYYY-MM (or RFC3339) to end the range at; defaults to --month (single-month query)")
 	costAttributionCmd.Flags().StringVar(&usagecostAttrFields, "fields", "*", `Comma-separated cost fields, e.g. "infra_host_on_demand_cost,infra_host_percentage_in_account"; "*" retrieves all (default)`)
 	costAttributionCmd.Flags().StringVar(&costTags, "tags", "", "Comma-separated tag keys to break cost down by (tag_breakdown_keys)")
@@ -145,7 +145,10 @@ Examples:
 			return err
 		}
 		if startMonth == "" {
-			startMonth = time.Now().UTC().Format("2006-01")
+			// Attribution for a month is only published by ~the 19th of the
+			// following month, so the previous month is the newest month that
+			// can actually have data.
+			startMonth = time.Now().UTC().AddDate(0, -1, 0).Format("2006-01")
 		}
 		endMonth := startMonth
 		if usagecostAttrEndMonth != "" {

@@ -605,8 +605,8 @@ ddx downtimes create --scope "env:staging" --monitor-id 123 --start now --end 2h
 | `--scope` | Scope the downtime applies to, e.g. `"env:(staging OR prod) AND datacenter:us-east-1"` (required) |
 | `--monitor-id` | Mute only this monitor id (mutually exclusive with `--monitor-tags`) |
 | `--monitor-tags` | Comma-separated monitor tags to mute (mutually exclusive with `--monitor-id`); omit both to mute all monitors in scope |
-| `--start` | timeparse form (`1h`, RFC3339, `now`, ...); omitted = starts immediately |
-| `--end` | timeparse form; omitted = never ends |
+| `--start` | `now`, RFC3339, epoch, or a bare duration (**future-anchored**: `1h` = one hour from now); omitted = starts immediately |
+| `--end` | Same forms (`2h` = two hours from now); must be after `--start` (validated client-side); omitted = never ends |
 | `--message` | Message included with downtime notifications |
 
 Only **one-time** schedules are supported — no recurrence modeling. Write-gated.
@@ -722,7 +722,7 @@ ddx cost attribution --month 2026-06 --tags team,env --sort-name infra_host --so
 |---------|------|---------|-------------|
 | `query` | `--queries` | — | Repeatable, same top-level-aware comma-splitting as `metrics query` |
 | | `--formulas` | — | Repeatable formula expressions |
-| `attribution` | `--month` | — | ISO `YYYY-MM` (or RFC3339): `start_month`, and `end_month` unless `--end-month` overrides it (required) |
+| `attribution` | `--month` | previous month | ISO `YYYY-MM` (or RFC3339): `start_month`, and `end_month` unless `--end-month` overrides it. Defaults to the previous UTC month — the newest month with published attribution data |
 | | `--end-month` | `--month` | End of the range, for multi-month queries |
 | | `--fields` | `*` | Comma-separated cost fields, e.g. `infra_host_on_demand_cost,infra_host_percentage_in_account`; `*` = all |
 | | `--tags` | — | Tag keys to break cost down by (`tag_breakdown_keys`) |

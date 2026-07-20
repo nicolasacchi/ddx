@@ -370,7 +370,7 @@ ddx downtimes create --scope "env:prod" --monitor-tags "service:checkout" --mess
 ddx downtimes create --scope "env:staging" --monitor-id 123 --start now --end 2h --yes
 ```
 
-`create` schedules a **one-time** downtime only (no recurrence modeling). Omit `--start`/`--end` for a downtime that starts immediately and never ends.
+`create` schedules a **one-time** downtime only (no recurrence modeling). Omit `--start`/`--end` for a downtime that starts immediately and never ends. Bare durations in `--start`/`--end` are **future-anchored** (`--end 2h` = two hours from now, unlike the lookback semantics of `--from`), and `--end` must be after `--start` (validated before sending).
 
 ### `synthetics` — Synthetic Tests
 
