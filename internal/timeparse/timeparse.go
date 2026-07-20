@@ -58,6 +58,15 @@ func ParseMillis(s string) (int64, error) {
 	return secs * 1000, nil
 }
 
+// ParseDuration parses a bare duration string ("1h", "5m", "24h", "7d",
+// "30d", "1w", ...) into a time.Duration, with no "now" anchoring applied.
+// Exported so callers that need the magnitude of a bare duration without
+// Parse's default past-anchoring (now-X) can reuse the same unit handling
+// (s/m/h/d/w plus the time.ParseDuration fallback) instead of duplicating it.
+func ParseDuration(s string) (time.Duration, error) {
+	return parseDuration(s)
+}
+
 func parseDuration(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {

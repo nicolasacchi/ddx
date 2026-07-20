@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/nicolasacchi/ddx/internal/timeparse"
 	"github.com/spf13/cobra"
@@ -21,6 +23,7 @@ func init() {
 	rootCmd.AddCommand(tracesCmd)
 	tracesCmd.AddCommand(tracesSearchCmd)
 	tracesCmd.AddCommand(tracesListCmd)
+	tracesCmd.AddCommand(tracesscalarWaterfallCmd)
 
 	tracesSearchCmd.Flags().StringVar(&tracesQuery, "query", "", "Span search query (e.g., service:web status:error)")
 	tracesSearchCmd.Flags().StringVar(&tracesCustomAttr, "custom-attrs", "", "Comma-separated wildcard patterns for custom attributes")
@@ -170,6 +173,8 @@ Examples:
 			fmt.Fprintln(cmd.ErrOrStderr(), "Explorer:", explorerURL)
 		}
 
+		fmt.Fprintf(cmd.ErrOrStderr(), "tip: for a hierarchical span tree, use `ddx traces waterfall %s`\n", args[0])
+
 		return printData("", spans)
 	},
 }
@@ -258,4 +263,242 @@ func splitColon(s string) []string {
 
 func parseTimeValue(s string) (int64, error) {
 	return timeparse.Parse(s)
+}
+
+// tracesscalarWaterfallCmd — GET api/v2/trace/{trace_id} (operationId
+// GetTraceByID, verified against openapi-v2.yaml: 60 req/min, x-unstable,
+// no pagination — `is_truncated` signals server-side payload overflow
+// instead). Reconstructs the span tree client-side and renders it as a
+// waterfall — the last high-value MCP fallback for trace inspection.
+var tracesscalarWaterfallCmd = &cobra.Command{
+	Use:   "waterfall <trace-id>",
+	Short: "Render a full trace as an indented span-tree waterfall",
+	Long: `Fetch the complete trace (every span, via GetTraceByID) and reconstruct the
+parent/child span tree client-side, rendered as a waterfall.
+
+Default output (TTY/human) is indented text: one line per span with
+service, resource (operation name), and duration in ms — marked [ERROR]
+when the span carries an error flag. Pass --json (or pipe the output) for
+a nested JSON tree instead: {"span": {...}, "children": [...]}.
+
+--limit caps the number of spans rendered (pre-order across the whole
+tree, root's children first); truncation is always noted on stderr, never
+silently dropped. Spans whose parent isn't in the trace (orphans) and true
+trace-roots both attach under a synthetic root, so nothing is dropped from
+the render even when Datadog returns a partial/re-parented set.
+
+Examples:
+  ddx traces waterfall 0000000000000000abc1230000000000
+  ddx traces waterfall 0000000000000000abc1230000000000 --json
+  ddx traces waterfall 0000000000000000abc1230000000000 --limit 20`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, err := getClient(cmd)
+		if err != nil {
+			return err
+		}
+
+		data, err := c.Get(context.Background(), "api/v2/trace/"+args[0], nil)
+		if err != nil {
+			return err
+		}
+
+		var resp tracesscalarTraceResponseRaw
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return fmt.Errorf("parse trace response: %w", err)
+		}
+
+		if resp.Data.Attributes.IsTruncated {
+			fmt.Fprintln(cmd.ErrOrStderr(), "traces waterfall: response truncated by Datadog (payload exceeded max size) — some spans may be missing")
+		}
+
+		totalSpans := len(resp.Data.Attributes.Spans)
+		root := tracesscalarBuildSpanTree(resp.Data.Attributes.Spans)
+
+		if isJSONMode() {
+			count := 0
+			tree := tracesscalarNodeToJSON(root, limitFlag, &count)
+			if limitFlag > 0 && count < totalSpans {
+				fmt.Fprintf(cmd.ErrOrStderr(), "traces waterfall: rendered %d of %d spans (--limit %d)\n", count, totalSpans, limitFlag)
+			}
+			out, err := json.Marshal(tree)
+			if err != nil {
+				return err
+			}
+			return printData("", out)
+		}
+
+		text, rendered, truncated := tracesscalarRenderWaterfallText(root, limitFlag)
+		if truncated {
+			fmt.Fprintf(cmd.ErrOrStderr(), "traces waterfall: rendered %d of %d spans (--limit %d)\n", rendered, totalSpans, limitFlag)
+		}
+		fmt.Fprint(cmd.OutOrStdout(), text)
+		return nil
+	},
+}
+
+// tracesscalarSpan is one entry of TraceDataAttributes.spans
+// (components.schemas.APMTraceSpan in openapi-v2.yaml). Required fields
+// per the spec: service, name, resource, traceID, spanID, parentID.
+// SpanID/ParentID/TraceID are uint64, not int64: the spec's own example
+// value (9876543210987654321) exceeds math.MaxInt64, and an int64 field
+// hard-fails json.Unmarshal on such a span instead of just misreading it.
+type tracesscalarSpan struct {
+	SpanID      uint64             `json:"spanID"`
+	ParentID    uint64             `json:"parentID"`
+	TraceID     uint64             `json:"traceID"`
+	TraceIDFull string             `json:"traceIDFull"`
+	Name        string             `json:"name"`
+	Resource    string             `json:"resource"`
+	Service     string             `json:"service"`
+	Type        string             `json:"type"`
+	StartTime   int64              `json:"startTime"`
+	EndTime     int64              `json:"endTime"`
+	Duration    int64              `json:"duration"`
+	Error       int                `json:"error"`
+	Meta        map[string]string  `json:"meta,omitempty"`
+	Metrics     map[string]float64 `json:"metrics,omitempty"`
+}
+
+// tracesscalarTraceResponseRaw models the GetTraceByID response
+// (components.schemas.TraceResponse / TraceData / TraceDataAttributes).
+type tracesscalarTraceResponseRaw struct {
+	Data struct {
+		ID         string `json:"id"`
+		Attributes struct {
+			IsTruncated bool               `json:"is_truncated"`
+			Spans       []tracesscalarSpan `json:"spans"`
+		} `json:"attributes"`
+	} `json:"data"`
+}
+
+// tracesscalarSpanNode is one node of the client-side reconstructed span
+// tree. IsRoot marks the synthetic root that trace-roots (parentID == 0)
+// and orphans (parentID pointing at a span not present in the payload)
+// both attach under — it carries no real span data of its own.
+type tracesscalarSpanNode struct {
+	Span     tracesscalarSpan
+	Children []*tracesscalarSpanNode
+	IsRoot   bool
+}
+
+// tracesscalarBuildSpanTree indexes spans by span_id and attaches children
+// via parent_id; spans whose parent_id is 0, self-referential, or does not
+// resolve to another span in the set (orphans) attach under a synthetic
+// root instead of being dropped. Children of every node are sorted by
+// start time. Pure — no I/O — unit-tested against a fabricated span set
+// (root, nested children, orphan).
+func tracesscalarBuildSpanTree(spans []tracesscalarSpan) *tracesscalarSpanNode {
+	byID := make(map[uint64]*tracesscalarSpanNode, len(spans))
+	for i := range spans {
+		byID[spans[i].SpanID] = &tracesscalarSpanNode{Span: spans[i]}
+	}
+
+	root := &tracesscalarSpanNode{IsRoot: true}
+	for _, sp := range spans {
+		node := byID[sp.SpanID]
+		parent, ok := byID[sp.ParentID]
+		if sp.ParentID == 0 || !ok || sp.ParentID == sp.SpanID {
+			root.Children = append(root.Children, node)
+			continue
+		}
+		parent.Children = append(parent.Children, node)
+	}
+
+	tracesscalarSortSpanChildren(root)
+	return root
+}
+
+// tracesscalarSortSpanChildren recursively sorts every node's children by
+// start time, stably (so same-timestamp spans keep their original order).
+func tracesscalarSortSpanChildren(n *tracesscalarSpanNode) {
+	sort.SliceStable(n.Children, func(i, j int) bool {
+		return n.Children[i].Span.StartTime < n.Children[j].Span.StartTime
+	})
+	for _, c := range n.Children {
+		tracesscalarSortSpanChildren(c)
+	}
+}
+
+// tracesscalarRenderWaterfallText renders the tree as indented text: one
+// line per span, "<indent>service resource (name) duration_ms[ERROR]".
+// limit <= 0 means unlimited; otherwise rendering stops in pre-order once
+// "limit" spans have been printed. Returns the rendered text, how many
+// spans were actually rendered, and whether the render was cut short.
+func tracesscalarRenderWaterfallText(root *tracesscalarSpanNode, limit int) (text string, rendered int, truncated bool) {
+	var b strings.Builder
+	count := 0
+	cut := false
+
+	var walk func(n *tracesscalarSpanNode, depth int)
+	walk = func(n *tracesscalarSpanNode, depth int) {
+		for _, c := range n.Children {
+			if cut {
+				return
+			}
+			if limit > 0 && count >= limit {
+				cut = true
+				return
+			}
+			count++
+			errMark := ""
+			if c.Span.Error != 0 {
+				errMark = " [ERROR]"
+			}
+			durMs := float64(c.Span.Duration) / 1e6
+			fmt.Fprintf(&b, "%s%s %s (%s) %.2fms%s\n", strings.Repeat("  ", depth), c.Span.Service, c.Span.Resource, c.Span.Name, durMs, errMark)
+			walk(c, depth+1)
+		}
+	}
+	walk(root, 0)
+
+	return b.String(), count, cut
+}
+
+// tracesscalarNodeToJSON renders the tree as nested JSON:
+// {"span": {...} | null, "children": [...]}. The synthetic root's "span" is
+// JSON null. limit <= 0 means unlimited; count is threaded through the
+// recursion (pre-order, root's children first) so the cap applies across
+// the whole tree rather than per-branch.
+func tracesscalarNodeToJSON(n *tracesscalarSpanNode, limit int, count *int) map[string]any {
+	out := map[string]any{}
+	if n.IsRoot {
+		out["span"] = nil
+	} else {
+		out["span"] = tracesscalarSpanToMap(n.Span)
+	}
+
+	children := []map[string]any{}
+	for _, c := range n.Children {
+		if limit > 0 && *count >= limit {
+			break
+		}
+		*count++
+		children = append(children, tracesscalarNodeToJSON(c, limit, count))
+	}
+	out["children"] = children
+	return out
+}
+
+// tracesscalarSpanToMap converts a span to a plain map for JSON output,
+// including a convenience duration_ms field alongside the raw nanosecond
+// duration.
+func tracesscalarSpanToMap(sp tracesscalarSpan) map[string]any {
+	return map[string]any{
+		"spanID":      sp.SpanID,
+		"parentID":    sp.ParentID,
+		"traceID":     sp.TraceID,
+		"traceIDFull": sp.TraceIDFull,
+		"service":     sp.Service,
+		"name":        sp.Name,
+		"resource":    sp.Resource,
+		"type":        sp.Type,
+		"startTime":   sp.StartTime,
+		"endTime":     sp.EndTime,
+		"duration":    sp.Duration,
+		"duration_ms": float64(sp.Duration) / 1e6,
+		"error":       sp.Error,
+		"meta":        sp.Meta,
+		"metrics":     sp.Metrics,
+	}
 }
