@@ -54,6 +54,14 @@ var validProfileBy = map[string]bool{
 	"summary":  true,
 }
 
+// profilerValidDiffBy restricts `diff --by` to the two views that support a
+// two-sided join (endpoint identity, function+file identity). "summary"
+// isn't offered here — a diff of totals-across-everything isn't a diff.
+var profilerValidDiffBy = map[string]bool{
+	"endpoint": true,
+	"function": true,
+}
+
 // Subcommand-scoped flag vars. Cobra binds the same variable on multiple
 // commands; only the currently-running command's flag populates it.
 var (
@@ -107,7 +115,9 @@ func init() {
 		"Arbitrary Datadog filter for the 'before' side (alternative to --before-version), e.g. 'pod_name:web-canary-X' or '@timestamp:[now-2h TO now-1h]'")
 	profileDiffCmd.Flags().StringVar(&profileAfterQuery, "after-query", "",
 		"Arbitrary Datadog filter for the 'after' side (alternative to --after-version)")
-	profileDiffCmd.Flags().IntVar(&profileTopN, "top", 20, "Top N endpoints by absolute delta")
+	profileDiffCmd.Flags().StringVar(&profileBy, "by", defaultProfileBy,
+		"Diff view: endpoint (per-endpoint delta) or function (per-function delta, function+file identity)")
+	profileDiffCmd.Flags().IntVar(&profileTopN, "top", 20, "Top N rows by absolute delta")
 
 	profileGetCmd.Flags().StringVar(&profileEventID, "event-id", "",
 		"Profile event id, the long base64 string from `ddx profile list` field `id` (required)")
@@ -161,6 +171,9 @@ Examples:
   ddx profile list --service web-1000farmacie --from 1h
   ddx profile list --service web-1000farmacie --query "kube_deployment:web-canary" --from 7d --limit 50`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := profilerCheckEndpointFilterTag(profileQuery); err != nil {
+			return err
+		}
 		c, err := getClient(cmd)
 		if err != nil {
 			return err
@@ -219,11 +232,18 @@ Examples:
   # Quick totals
   ddx profile aggregate --service web-1000farmacie --by summary --from 1h`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		profilerResolveByFlag(cmd, defaultProfileBy)
 		if !validProfileTypes[profileType] {
 			return invalidProfileTypeError(profileType)
 		}
 		if !validProfileBy[profileBy] {
 			return fmt.Errorf("invalid --by %q, want one of: endpoint, function, summary", profileBy)
+		}
+		if err := profilerCheckEndpointFilterTag(profileQuery); err != nil {
+			return err
+		}
+		if msg := profilerHeapSamplesEndpointWarning(profileType, profileBy); msg != "" {
+			fmt.Fprintln(os.Stderr, "warning: "+msg)
 		}
 
 		c, err := getClient(cmd)
@@ -267,6 +287,9 @@ Examples:
   ddx profile summary --service web-1000farmacie --from 1h
   ddx profile summary --service web-1000farmacie --query "kube_deployment:web-canary" --from 24h`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := profilerCheckEndpointFilterTag(profileQuery); err != nil {
+			return err
+		}
 		c, err := getClient(cmd)
 		if err != nil {
 			return err
@@ -292,14 +315,20 @@ Examples:
 
 var profileDiffCmd = &cobra.Command{
 	Use:   "diff",
-	Short: "Per-endpoint delta between two arbitrary scopes (versions, pods, time windows, etc.)",
-	Long: `Compare profiler endpointValues between two filter scopes.
+	Short: "Delta between two arbitrary scopes (versions, pods, time windows, etc.) — by endpoint or function",
+	Long: `Compare profiler data between two filter scopes.
 Useful for "did this PR introduce a regression" or "is one canary pod
 allocating more than another."
 
 You must specify each side either by version tag (--before-version / --after-version)
 which compose into "version:vXXX" clauses, OR by an arbitrary --before-query /
 --after-query string for non-version comparisons (pods, time slices, etc.).
+
+--by endpoint (default) diffs per-endpoint totals, joined by endpoint name.
+--by function diffs per-function totals from the flame graph, joined by
+(function, file) identity — frame indices aren't stable across two
+independently-captured aggregate responses, so function/file is the only
+safe join key.
 
 Examples:
   # Did v2026.4.58 increase allocation rate vs v2026.4.57?
@@ -319,11 +348,32 @@ Examples:
   # Canary vs primary deployment (different deployments)
   ddx profile diff --service web-1000farmacie --type alloc-samples \
     --before-query "kube_deployment:web-canary" \
-    --after-query  "kube_deployment:web" --from 1h`,
+    --after-query  "kube_deployment:web" --from 1h
+
+  # Per-function delta instead of per-endpoint
+  ddx profile diff --service web-1000farmacie --type alloc-samples --by function \
+    --before-version v2026.4.57 --after-version v2026.4.58 --from 2d --top 30`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		profilerResolveByFlag(cmd, defaultProfileBy)
 		if !validProfileTypes[profileType] {
 			return invalidProfileTypeError(profileType)
 		}
+		if !profilerValidDiffBy[profileBy] {
+			return fmt.Errorf("invalid --by %q for `diff`, want one of: endpoint, function", profileBy)
+		}
+		if err := profilerCheckEndpointFilterTag(profileQuery); err != nil {
+			return err
+		}
+		if err := profilerCheckEndpointFilterTag(profileBeforeQuery); err != nil {
+			return err
+		}
+		if err := profilerCheckEndpointFilterTag(profileAfterQuery); err != nil {
+			return err
+		}
+		if msg := profilerHeapSamplesEndpointWarning(profileType, profileBy); msg != "" {
+			fmt.Fprintln(os.Stderr, "warning: "+msg)
+		}
+
 		// Resolve before/after filter clauses; require at least one form per side.
 		beforeClause, beforeLabel, err := resolveDiffSide("before", profileBeforeVersion, profileBeforeQuery)
 		if err != nil {
@@ -355,16 +405,42 @@ Examples:
 			return fmt.Errorf("after query failed: %w", err)
 		}
 
-		beforeEndpoints, beforeMeta, err := extractEndpointValues(beforeRaw)
+		beforeWindow, err := profilerExtractWindowMeta(beforeRaw)
 		if err != nil {
 			return fmt.Errorf("before parse: %w", err)
 		}
-		afterEndpoints, afterMeta, err := extractEndpointValues(afterRaw)
+		afterWindow, err := profilerExtractWindowMeta(afterRaw)
 		if err != nil {
 			return fmt.Errorf("after parse: %w", err)
 		}
+		if msg := profilerDiffRepresentativenessWarning(beforeWindow.ProfilesAggregated, beforeWindow.ProfilesInWindow, afterWindow.ProfilesAggregated, afterWindow.ProfilesInWindow); msg != "" {
+			fmt.Fprintln(os.Stderr, "warning: "+msg)
+		}
 
-		out := buildEndpointDiff(beforeEndpoints, afterEndpoints, beforeLabel, afterLabel, profileType, profileTopN, beforeMeta, afterMeta)
+		var out map[string]any
+		switch profileBy {
+		case "function":
+			beforeFns, err := profilerExtractFunctionTotals(beforeRaw)
+			if err != nil {
+				return fmt.Errorf("before parse: %w", err)
+			}
+			afterFns, err := profilerExtractFunctionTotals(afterRaw)
+			if err != nil {
+				return fmt.Errorf("after parse: %w", err)
+			}
+			out = profilerBuildFunctionDiff(beforeFns, afterFns, beforeLabel, afterLabel, profileType, profileTopN, beforeWindow.Metadata, afterWindow.Metadata)
+		default: // "endpoint"
+			beforeEndpoints, _, err := extractEndpointValues(beforeRaw)
+			if err != nil {
+				return fmt.Errorf("before parse: %w", err)
+			}
+			afterEndpoints, _, err := extractEndpointValues(afterRaw)
+			if err != nil {
+				return fmt.Errorf("after parse: %w", err)
+			}
+			out = buildEndpointDiff(beforeEndpoints, afterEndpoints, beforeLabel, afterLabel, profileType, profileTopN, beforeWindow.Metadata, afterWindow.Metadata)
+		}
+
 		jsonBytes, err := json.Marshal(out)
 		if err != nil {
 			return err
@@ -415,6 +491,7 @@ Examples:
   # Per-profile endpoint hotspots (which endpoints did this pod serve in this 60s?)
   ddx profile get --event-id E --profile-id P --by endpoint --top 10 --type alloc-samples`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		profilerResolveByFlag(cmd, "info")
 		c, err := getClient(cmd)
 		if err != nil {
 			return err
@@ -426,6 +503,9 @@ Examples:
 		case "endpoint":
 			if !validProfileTypes[profileType] {
 				return invalidProfileTypeError(profileType)
+			}
+			if msg := profilerHeapSamplesEndpointWarning(profileType, profileBy); msg != "" {
+				fmt.Fprintln(os.Stderr, "warning: "+msg)
 			}
 			raw, err := callSingleProfileAggregate(c, profileType)
 			if err != nil {
@@ -642,10 +722,13 @@ func printProfileEndpointView(raw json.RawMessage, profType string, topN int) er
 		}
 	}
 
-	// For heap-live-* types, warn when _UNASSIGNED_ swamps the result —
-	// Ruby's retained-heap samples lack endpoint attribution, so endpoint
-	// view is uninformative; function view is what the user wants.
-	if (profType == "heap-live-samples" || profType == "heap-live-size") && total > 0 {
+	// heap-live-samples gets a deterministic pre-flight warning instead (see
+	// profilerHeapSamplesEndpointWarning) — Ruby's retained-heap sampler
+	// NEVER attributes those samples to an endpoint, so there's no need to
+	// wait for the response to know it's uninformative. heap-live-size isn't
+	// guaranteed the same way, so it keeps this data-driven check: warn only
+	// when _UNASSIGNED_ actually swamps the result.
+	if profType == "heap-live-size" && total > 0 {
 		if v, ok := resp.EndpointValues["_UNASSIGNED_"]; ok && v/total > 0.80 {
 			fmt.Fprintf(os.Stderr,
 				"hint: --type %s --by endpoint is uninformative because Ruby's retained-heap profiler doesn't tag samples with endpoints (_UNASSIGNED_=%.0f %% here). Try --by function instead.\n",
@@ -782,6 +865,242 @@ func absF(v float64) float64 {
 		return -v
 	}
 	return v
+}
+
+// ----------------------------------------------------------------------------
+// Pre-flight validations
+// ----------------------------------------------------------------------------
+
+// profilerResolveByFlag works around a pflag quirk: profileBy is a single
+// package-level variable bound via Flags().StringVar on three commands
+// (aggregate, get, diff) with DIFFERENT defaults ("endpoint", "info",
+// "endpoint"). StringVar assigns its default into the bound variable
+// IMMEDIATELY at registration time (init()), not at parse time — so
+// whichever command's init() registration runs last leaves its default
+// sitting in profileBy for every command that doesn't explicitly pass --by,
+// regardless of which command is actually running. Call this at the top of
+// each such RunE, before reading profileBy, to restore the running command's
+// own default when the user didn't pass --by.
+func profilerResolveByFlag(cmd *cobra.Command, ownDefault string) {
+	if !cmd.Flags().Changed("by") {
+		profileBy = ownDefault
+	}
+}
+
+// profilerCheckEndpointFilterTag pre-flight-rejects a user-supplied Datadog
+// query containing "@endpoint:". Profiles carry no such facet — the API
+// accepts the query but silently matches nothing (profiles_in_window: 0),
+// which otherwise looks like an empty time window rather than a bad filter.
+func profilerCheckEndpointFilterTag(query string) error {
+	if strings.Contains(query, "@endpoint:") {
+		return fmt.Errorf("@endpoint: is not a filter tag on profiles (returns profiles_in_window: 0); filter by endpoint via --by endpoint output instead")
+	}
+	return nil
+}
+
+// profilerHeapSamplesEndpointWarning returns the pre-flight stderr warning
+// for --type heap-live-samples combined with --by endpoint, or "" when the
+// combination doesn't apply. Ruby's retained-heap sampler never attributes a
+// sample to an endpoint (they all land in _UNASSIGNED_), so this is knowable
+// from the flags alone — no need to wait for the API round-trip to find out.
+func profilerHeapSamplesEndpointWarning(profType, by string) string {
+	if profType == "heap-live-samples" && by == "endpoint" {
+		return "--type heap-live-samples --by endpoint is uninformative — Ruby's retained-heap profiler doesn't tag samples with endpoints (all land in _UNASSIGNED_). Use --by function instead."
+	}
+	return ""
+}
+
+// profilerDiffRepresentativenessWarning returns a stderr-ready warning when a
+// diff comparison looks unrepresentative — either side matched zero profiles
+// in its window, or the two sides pulled in wildly different profile counts
+// (more than 5x apart) — or "" when the comparison looks sound.
+func profilerDiffRepresentativenessWarning(beforeAggregated, beforeInWindow, afterAggregated, afterInWindow int) string {
+	if beforeInWindow == 0 || afterInWindow == 0 {
+		return fmt.Sprintf("comparison may be unrepresentative — profiles_in_window is 0 on at least one side (before=%d, after=%d)", beforeInWindow, afterInWindow)
+	}
+	lo, hi := beforeAggregated, afterAggregated
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	if lo == 0 || float64(hi)/float64(lo) > 5.0 {
+		return fmt.Sprintf("comparison may be unrepresentative — profiles_aggregated differ by more than 5x (before=%d, after=%d)", beforeAggregated, afterAggregated)
+	}
+	return ""
+}
+
+// ----------------------------------------------------------------------------
+// Function-diff helpers (`diff --by function`)
+// ----------------------------------------------------------------------------
+
+// profilerWindowMeta carries the small set of window-level fields shared by
+// both diff paths (endpoint and function): how many profiles were combined
+// into this aggregate call, how many profiles matched the query in the time
+// window before any limit/sampling, and the metadata blob to echo back.
+type profilerWindowMeta struct {
+	ProfilesAggregated int
+	ProfilesInWindow   int
+	Metadata           json.RawMessage
+}
+
+// profilerExtractWindowMeta pulls the window-level counters out of a raw
+// aggregate response, independent of which --by view is being rendered.
+func profilerExtractWindowMeta(raw json.RawMessage) (profilerWindowMeta, error) {
+	var resp aggregateResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return profilerWindowMeta{}, err
+	}
+	return profilerWindowMeta{
+		ProfilesAggregated: resp.NumberOfProfiles,
+		ProfilesInWindow:   resp.TotalProfilesCount,
+		Metadata:           resp.Metadata,
+	}, nil
+}
+
+// profilerFunctionEntry is one (function, file) identity with its aggregated
+// leaf value, as produced by profilerExtractFunctionTotals.
+type profilerFunctionEntry struct {
+	Function string
+	File     string
+	Value    float64
+}
+
+// profilerFunctionIdentityKey builds the join key used to match a function
+// across two independently-captured aggregate responses. Frame indices are
+// NOT stable across separate API calls — each response builds its own
+// strings table from scratch — so joins must use the resolved (function,
+// file) identity instead of the frame index that `aggregate --by function`
+// groups by internally (safe there because it never leaves a single response).
+func profilerFunctionIdentityKey(function, file string) string {
+	return function + "\x00" + file
+}
+
+// profilerExtractFunctionTotals decodes a raw aggregate response's flame
+// graph and aggregates leaf values by (function, file) identity. It reuses
+// the same decode primitives (parseFlameNode / collectLeaves / resolveFrames)
+// that `aggregate --by function` uses in profile_decode.go, rather than
+// re-parsing the packed flame graph a second time — the only new step here
+// is merging leaves that share a (function, file) identity but landed at
+// different frame indices (recursion, multiple call sites, etc.), which
+// aggregate --by function doesn't need to do since it never joins across
+// two separate responses.
+func profilerExtractFunctionTotals(raw json.RawMessage) ([]profilerFunctionEntry, error) {
+	var resp struct {
+		FlameGraph  json.RawMessage `json:"flameGraph"`
+		Frames      [][]int         `json:"frames"`
+		Strings     []string        `json:"strings"`
+		FrameSchema []string        `json:"frameSchema"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("parse aggregate response: %w", err)
+	}
+	if len(resp.FlameGraph) == 0 {
+		return nil, fmt.Errorf("response has no flameGraph; check --service / --query / --from / --type values")
+	}
+
+	root, err := parseFlameNode(resp.FlameGraph)
+	if err != nil {
+		return nil, fmt.Errorf("decode flame graph: %w", err)
+	}
+
+	leafByFrame := make(map[int]float64)
+	collectLeaves(root, leafByFrame)
+
+	frameInfos := resolveFrames(resp.Frames, resp.FrameSchema, resp.Strings)
+
+	byKey := make(map[string]*profilerFunctionEntry)
+	keyOrder := make([]string, 0, len(leafByFrame))
+	for fIdx, value := range leafByFrame {
+		var info frameInfo
+		if fIdx >= 0 && fIdx < len(frameInfos) {
+			info = frameInfos[fIdx]
+		}
+		key := profilerFunctionIdentityKey(info.Function, info.File)
+		if e, ok := byKey[key]; ok {
+			e.Value += value
+		} else {
+			byKey[key] = &profilerFunctionEntry{Function: info.Function, File: info.File, Value: value}
+			keyOrder = append(keyOrder, key)
+		}
+	}
+
+	entries := make([]profilerFunctionEntry, 0, len(byKey))
+	for _, key := range keyOrder {
+		entries = append(entries, *byKey[key])
+	}
+	return entries, nil
+}
+
+// profilerFunctionDiffRow is one row in the function-diff table — the
+// function-view counterpart of diffRow.
+type profilerFunctionDiffRow struct {
+	Function   string  `json:"function"`
+	File       string  `json:"file,omitempty"`
+	Before     float64 `json:"before"`
+	After      float64 `json:"after"`
+	Delta      float64 `json:"delta"`
+	PercentChg float64 `json:"percent_change"`
+}
+
+// profilerBuildFunctionDiff joins two function-total slices by (function,
+// file) identity and computes per-function deltas + percent changes,
+// mirroring buildEndpointDiff's shape and semantics. Functions present on
+// only one side are still included (missing side = 0).
+func profilerBuildFunctionDiff(before, after []profilerFunctionEntry, beforeVer, afterVer, profType string, topN int, beforeMeta, afterMeta json.RawMessage) map[string]any {
+	beforeByKey := make(map[string]profilerFunctionEntry, len(before))
+	for _, e := range before {
+		beforeByKey[profilerFunctionIdentityKey(e.Function, e.File)] = e
+	}
+	afterByKey := make(map[string]profilerFunctionEntry, len(after))
+	for _, e := range after {
+		afterByKey[profilerFunctionIdentityKey(e.Function, e.File)] = e
+	}
+
+	seen := make(map[string]bool, len(beforeByKey)+len(afterByKey))
+	for k := range beforeByKey {
+		seen[k] = true
+	}
+	for k := range afterByKey {
+		seen[k] = true
+	}
+
+	rows := make([]profilerFunctionDiffRow, 0, len(seen))
+	for key := range seen {
+		b := beforeByKey[key]
+		a := afterByKey[key]
+		function, file := b.Function, b.File
+		if function == "" && a.Function != "" {
+			function, file = a.Function, a.File
+		}
+		row := profilerFunctionDiffRow{
+			Function: function,
+			File:     file,
+			Before:   b.Value,
+			After:    a.Value,
+			Delta:    a.Value - b.Value,
+		}
+		if b.Value > 0 {
+			row.PercentChg = (a.Value - b.Value) / b.Value * 100.0
+		}
+		rows = append(rows, row)
+	}
+
+	sort.SliceStable(rows, func(i, j int) bool {
+		return absF(rows[i].Delta) > absF(rows[j].Delta)
+	})
+	if topN > 0 && len(rows) > topN {
+		rows = rows[:topN]
+	}
+
+	return map[string]any{
+		"profile_type":     profType,
+		"before_version":   beforeVer,
+		"after_version":    afterVer,
+		"before_functions": len(before),
+		"after_functions":  len(after),
+		"top_by_abs_delta": rows,
+		"before_metadata":  beforeMeta,
+		"after_metadata":   afterMeta,
+	}
 }
 
 // (extractData is defined in logs.go and shared across the commands package.)
