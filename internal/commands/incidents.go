@@ -31,7 +31,25 @@ var (
 	incidentRootCauseFile string
 	incidentSummary       string
 	incidentResolved      string
+
+	// --all pagination for incidents list.
+	irIncidentsListAll bool
+
+	// incidents create flags.
+	irIncidentTitle       string
+	irIncidentSeverity    string
+	irIncidentSummary     string
+	irIncidentImpacted    bool
+	irIncidentImpactScope string
+	irIncidentCommander   string
 )
+
+// irValidIncidentSeverities is the SEV-1..SEV-5 enum accepted by
+// --severity on `incidents create` (and by extension `update`, though that
+// path predates this package and isn't re-validated here).
+var irValidIncidentSeverities = map[string]bool{
+	"SEV-1": true, "SEV-2": true, "SEV-3": true, "SEV-4": true, "SEV-5": true,
+}
 
 // incidentFieldTypes maps Datadog incident field names to their schema "type"
 // values. Required because PATCH /api/v2/incidents/{uuid} expects each field
@@ -53,9 +71,11 @@ func init() {
 	incidentsCmd.AddCommand(incidentsFacetsCmd)
 	incidentsCmd.AddCommand(incidentsUpdateCmd)
 	incidentsCmd.AddCommand(incidentsResolveCmd)
+	incidentsCmd.AddCommand(irIncidentsCreateCmd)
 
 	incidentsListCmd.Flags().StringVar(&incidentsQuery, "query", "state:active", "Search query (state, severity, team, commander, etc.)")
 	incidentsListCmd.Flags().StringVar(&incidentsSort, "sort", "-created", "Sort field (created, -created, resolved, -severity, etc.)")
+	incidentsListCmd.Flags().BoolVar(&irIncidentsListAll, "all", false, "Fetch every result page (loops page[offset]/page[size] search pagination, capped at 20 pages) instead of just the first page")
 
 	incidentsGetCmd.Flags().BoolVar(&incidentTimeline, "timeline", false, "Include timeline with comments and status changes")
 	incidentsGetCmd.Flags().StringVar(&incidentTimelineFrom, "timeline-from", "", "Filter timeline entries after this time")
@@ -72,6 +92,14 @@ func init() {
 
 	incidentsResolveCmd.Flags().StringVar(&incidentRootCause, "root-cause", "", "Root-cause text to record on resolution")
 	incidentsResolveCmd.Flags().StringVar(&incidentRootCauseFile, "root-cause-file", "", "Read root cause from file (use '-' for stdin)")
+
+	irIncidentsCreateCmd.Flags().StringVar(&irIncidentTitle, "title", "", "Incident title (required)")
+	irIncidentsCreateCmd.Flags().StringVar(&irIncidentSeverity, "severity", "", "Severity: SEV-1, SEV-2, SEV-3, SEV-4, SEV-5")
+	irIncidentsCreateCmd.Flags().StringVar(&irIncidentSummary, "summary", "", "Incident summary")
+	irIncidentsCreateCmd.Flags().BoolVar(&irIncidentImpacted, "customer-impacted", false, "Flag the incident as customer-impacting")
+	irIncidentsCreateCmd.Flags().StringVar(&irIncidentImpactScope, "customer-impact-scope", "", "Summary of customer impact; required when --customer-impacted is set")
+	irIncidentsCreateCmd.Flags().StringVar(&irIncidentCommander, "commander", "", "Datadog user UUID to set as incident commander")
+	irIncidentsCreateCmd.MarkFlagRequired("title")
 }
 
 var incidentsCmd = &cobra.Command{
@@ -96,6 +124,27 @@ Examples:
 			return err
 		}
 
+		if irIncidentsListAll {
+			const pageSize = 100 // page[size] max, per PageSize parameter in the spec
+			fetch := func(offset, size int) ([]json.RawMessage, int, error) {
+				params := url.Values{}
+				params.Set("query", incidentsQuery)
+				params.Set("sort", incidentsSort)
+				params.Set("page[size]", strconv.Itoa(size))
+				params.Set("page[offset]", strconv.Itoa(offset))
+				data, err := c.Get(context.Background(), "api/v2/incidents/search", params)
+				if err != nil {
+					return nil, 0, err
+				}
+				return irParseIncidentSearchPage(data)
+			}
+			items, _, err := paginateOffset(fetch, pageSize, 20)
+			if err != nil {
+				return err
+			}
+			return printData("incidents.list", irFlattenIncidentItems(items))
+		}
+
 		params := url.Values{}
 		params.Set("query", incidentsQuery)
 		params.Set("sort", incidentsSort)
@@ -106,8 +155,14 @@ Examples:
 			return err
 		}
 
-		incidents := extractIncidents(data)
-		return printData("incidents.list", incidents)
+		items, total, err := irParseIncidentSearchPage(data)
+		if err != nil {
+			return err
+		}
+		if total > len(items) {
+			fmt.Fprintf(os.Stderr, "incidents.list: showing %d of %d (use --all to fetch every page)\n", len(items), total)
+		}
+		return printData("incidents.list", irFlattenIncidentItems(items))
 	},
 }
 
@@ -353,34 +408,181 @@ func patchIncident(cmd *cobra.Command, c *client.Client, id string, fields map[s
 	return printData("", data)
 }
 
-func extractIncidents(raw json.RawMessage) json.RawMessage {
+// irParseIncidentSearchPage parses one page of a GET /api/v2/incidents/search
+// response. Per the IncidentSearchResponse schema, results live at
+// data.attributes.incidents (not the top-level data[] some other Datadog v2
+// list endpoints use) and the reported total lives at data.attributes.total.
+// Pure — no network — so it's directly unit-testable against fixture JSON.
+func irParseIncidentSearchPage(raw json.RawMessage) ([]json.RawMessage, int, error) {
+	var wrapper struct {
+		Data struct {
+			Attributes struct {
+				Incidents []json.RawMessage `json:"incidents"`
+				Total     int               `json:"total"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &wrapper); err != nil {
+		return nil, 0, fmt.Errorf("parse incidents search response: %w", err)
+	}
+	return wrapper.Data.Attributes.Incidents, wrapper.Data.Attributes.Total, nil
+}
+
+// irUnwrapIncidentItem unwraps the per-incident envelope the search response
+// schema documents (IncidentSearchResponseIncidentsData wraps each entry as
+// {"data": {id, type, attributes}}, i.e. IncidentResponseData nested one
+// level deeper than most v2 list endpoints). Falls back to the item itself
+// when there's no nested "data" key, in case a given API version returns the
+// flatter shape instead — cheap defensiveness against a spec/response
+// mismatch we can't exercise against a live API in this environment.
+func irUnwrapIncidentItem(item json.RawMessage) json.RawMessage {
 	var wrapper struct {
 		Data json.RawMessage `json:"data"`
 	}
-	if json.Unmarshal(raw, &wrapper) == nil && wrapper.Data != nil {
-		// Flatten incidents from data[].attributes
-		var items []json.RawMessage
-		if json.Unmarshal(wrapper.Data, &items) == nil {
-			var result []map[string]any
-			for _, item := range items {
-				var obj struct {
-					ID         string          `json:"id"`
-					Attributes json.RawMessage `json:"attributes"`
-				}
-				if json.Unmarshal(item, &obj) == nil {
-					var attrs map[string]any
-					if json.Unmarshal(obj.Attributes, &attrs) == nil {
-						attrs["id"] = obj.ID
-						result = append(result, attrs)
-					}
-				}
-			}
-			if result != nil {
-				out, _ := json.Marshal(result)
-				return out
-			}
-		}
+	if json.Unmarshal(item, &wrapper) == nil && wrapper.Data != nil {
 		return wrapper.Data
 	}
-	return raw
+	return item
+}
+
+// irFlattenIncidentItems unwraps and flattens a page of incidents-search
+// results into the same id+attributes shape flattenV2Items produces for
+// other v2 list endpoints in this codebase.
+func irFlattenIncidentItems(items []json.RawMessage) json.RawMessage {
+	unwrapped := make([]json.RawMessage, len(items))
+	for i, item := range items {
+		unwrapped[i] = irUnwrapIncidentItem(item)
+	}
+	arr, err := json.Marshal(unwrapped)
+	if err != nil {
+		out, _ := json.Marshal(items)
+		return out
+	}
+	return flattenV2Items(arr)
+}
+
+var irIncidentsCreateCmd = &cobra.Command{
+	Use:   "create",
+	Short: "Create a new incident",
+	Long: `Create a new incident. Datadog assigns the incident number (public_id/slug)
+on creation — this command never sets fields.slug or public_id itself (repo-wide
+policy: IR- numbers belong to Datadog, never invented locally). The assigned
+id is printed after creation.
+
+Examples:
+  ddx incidents create --title "Checkout errors spiking" --severity SEV-2 --yes
+  ddx incidents create --title "Elevated 500s" --customer-impacted --customer-impact-scope "EU checkout" --yes
+  ddx incidents create --title "Test drill" --dry-run`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, err := getClient(cmd)
+		if err != nil {
+			return err
+		}
+
+		body, err := irBuildIncidentCreateBody(irIncidentTitle, irIncidentSeverity, irIncidentSummary, irIncidentImpacted, irIncidentImpactScope, irIncidentCommander)
+		if err != nil {
+			return err
+		}
+
+		if dryRun() {
+			fmt.Fprintf(cmd.OutOrStdout(), "--dry-run: would create incident %q (severity=%q customer_impacted=%v), no changes made\n", irIncidentTitle, irIncidentSeverity, irIncidentImpacted)
+			return nil
+		}
+		if err := requireConfirm(fmt.Sprintf("creating incident %q", irIncidentTitle)); err != nil {
+			return err
+		}
+
+		data, err := c.Post(context.Background(), "api/v2/incidents", body)
+		if err != nil {
+			return err
+		}
+
+		uuid, publicID, slug, title := irExtractIncidentIdentity(data)
+		if !isJSONMode() {
+			label := publicID
+			if label == "" {
+				label = slug
+			}
+			if label == "" {
+				label = uuid
+			}
+			fmt.Fprintf(os.Stderr, "Created incident %s: %q (uuid=%s)\n", label, title, uuid)
+		}
+
+		return printData("", data)
+	},
+}
+
+// irBuildIncidentCreateBody builds the POST /api/v2/incidents request body.
+// Pure — validates the same required-field rules the spec documents
+// (title, customer_impacted always; customer_impact_scope when impacted is
+// true) and never emits fields.slug or public_id — Datadog assigns the
+// incident number, so this function has no parameter that could set either.
+func irBuildIncidentCreateBody(title, severity, summary string, impacted bool, impactScope, commander string) (map[string]any, error) {
+	if strings.TrimSpace(title) == "" {
+		return nil, fmt.Errorf("--title is required")
+	}
+	if impacted && strings.TrimSpace(impactScope) == "" {
+		return nil, fmt.Errorf("--customer-impact-scope is required when --customer-impacted is set")
+	}
+	if severity != "" && !irValidIncidentSeverities[severity] {
+		return nil, fmt.Errorf("invalid --severity %q: must be one of SEV-1, SEV-2, SEV-3, SEV-4, SEV-5", severity)
+	}
+
+	fields := map[string]any{}
+	addIncidentField(fields, "severity", severity)
+	addIncidentField(fields, "summary", summary)
+
+	attrs := map[string]any{
+		"title":             title,
+		"customer_impacted": impacted,
+	}
+	if impactScope != "" {
+		attrs["customer_impact_scope"] = impactScope
+	}
+	if len(fields) > 0 {
+		attrs["fields"] = fields
+	}
+
+	data := map[string]any{
+		"type":       "incidents",
+		"attributes": attrs,
+	}
+	if commander != "" {
+		data["relationships"] = map[string]any{
+			"commander_user": map[string]any{
+				"data": map[string]any{
+					"id":   commander,
+					"type": "users",
+				},
+			},
+		}
+	}
+
+	return map[string]any{"data": data}, nil
+}
+
+// irExtractIncidentIdentity pulls the identifiers worth printing prominently
+// out of a CreateIncident/GetIncident response. public_id/slug aren't listed
+// in the vendored IncidentResponseAttributes schema (it declares
+// additionalProperties: {}, so undocumented fields are permitted) but are
+// well-established as present on real incident objects — see CLAUDE.md Rule
+// 8 ("slug == public_id") and resolveIncidentUUID's numeric-id round trip
+// above. Returns empty strings for any field genuinely absent from the
+// response rather than guessing.
+func irExtractIncidentIdentity(raw json.RawMessage) (uuid, publicID, slug, title string) {
+	var wrapper struct {
+		Data struct {
+			ID         string `json:"id"`
+			Attributes struct {
+				Title    string `json:"title"`
+				PublicID string `json:"public_id"`
+				Slug     string `json:"slug"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(raw, &wrapper) != nil {
+		return "", "", "", ""
+	}
+	return wrapper.Data.ID, wrapper.Data.Attributes.PublicID, wrapper.Data.Attributes.Slug, wrapper.Data.Attributes.Title
 }
