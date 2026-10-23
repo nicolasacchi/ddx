@@ -30,6 +30,12 @@ type Client struct {
 	baseURL    string
 	verbose    bool
 	maxRetries int
+
+	// backoffSleep overrides the retry sleep in rate-limited calls (tests).
+	backoffSleep func(ctx context.Context, d time.Duration) error
+	// retryNotify, if set, is told about retry waits longer than 2s (the CLI
+	// prints a one-line stderr note unless --quiet).
+	retryNotify func(d time.Duration, why string)
 }
 
 // New creates a Datadog API client. The site parameter determines the base URL

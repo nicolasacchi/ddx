@@ -426,6 +426,45 @@ ddx rum metrics delete rum.sessions.web.count --yes
 
 `retention-filters create`/`update`/`delete` and `metrics create`/`delete` are write-gated.
 
+### pa (Product Analytics)
+
+```bash
+ddx pa list --query "@type:action" --columns @action.name,@session.id --from 1d --format csv --out actions.csv
+ddx pa list --query "@type:action" --columns @action.name --from 2h --sort asc --format jsonl
+ddx pa scalar --query "@type:action" --compute count --group-by @type --from 7d
+ddx pa scalar --query "@type:view" --compute "cardinality(@session.id)" --group-by "@view.name:50"
+ddx pa timeseries --query "@type:view" --compute "cardinality(@session.id)" --interval 1d --from 14d --group-by @device.type
+```
+
+Alias `product-analytics`. The **unsampled** event store (15-month retention, raw grain) — `rum events` only sees the ~5% retention-filtered sample. Scope: `rum_apps_read`.
+
+**API**: `POST /api/v2/product-analytics/analytics/list` (list), `.../analytics/scalar`, `.../analytics/timeseries`. Request type `formula_analytics_extended_list_request` (list) / `formula_analytics_extended_request` (scalar, timeseries). In scalar/timeseries `compute` is a **sibling** of the inner `query` (not inside it); list `sort` is an **object** `{"facet":"timestamp","order":"asc|desc"}` (a string 400s); `limit` ≤1000 and there is **no cursor/offset**.
+
+| Flag | Applies to | Default | Description |
+|------|-----------|---------|-------------|
+| `--query` | all | `*` | Product Analytics search query |
+| `--data-source` | all | `product_analytics` | or `product_analytics_occurrence` |
+| `--min-interval` | all | `1s` (`DDX_PA_MIN_INTERVAL`) | Minimum spacing of API calls across ALL ddx processes |
+| `--cache-bust` | all | true | Append `-@ddx_nonce:<hex>` so the API response cache cannot serve stale data |
+| `--columns` | list | — | Comma-separated columns (required); `timestamp` is always returned |
+| `--sort` | list | `desc` | `asc` or `desc` |
+| `--page-size` | list | 1000 | Rows per call (1-1000) |
+| `--max-rows` | list | 0 (all) | Stop after N rows. Under `CLAUDECODE`, default is a 100-row stdout cap (reported on stderr) unless set explicitly (0 = all) or `--out` is used. Global `--limit` does not apply |
+| `--format` | all | `json` | list: `json` (streamed array) / `jsonl` / `csv`; scalar/timeseries: `json` / `csv` |
+| `--out` | list | — | Write rows to a file (never agent-capped) |
+| `--compute` | scalar, timeseries | `count` | `count`, `cardinality(@f)`, `sum(@f)`, `avg(@f)`, `min(@f)`, `max(@f)` |
+| `--group-by` | scalar, timeseries | — | `@facet[:limit]` (limit default 20), repeatable |
+| `--interval` | timeseries | `1h` | Go duration or `1d`/`1w` |
+
+**Rate limit** (`internal/ratelimit`, generic — `client.PostRateLimited` takes any bucket): the API allows 60 req/min **per user** (`x-ratelimit-name: analytics_extended_per_user`), shared by every process on the same keys. State lives in `$XDG_STATE_HOME/ddx/ratelimit/<bucket>.{lock,json}` (fallback `~/.local/state/…`); `<bucket>.json` is `{"next_unix_nano": N}`, mutated under `flock` on `<bucket>.lock`. Each call *reserves* the next slot (`max(now,next)` → `next = slot + interval`) under the lock then sleeps outside it. `x-ratelimit-remaining: 0` blocks the bucket until `x-ratelimit-reset`; 429 blocks it until reset (+≤250ms jitter) and retries (max 8 tries); 5xx/network errors back off 1s,2s,4s… (cap 30s); other 4xx return the API error. A stderr note is printed when a wait exceeds 2s (`--quiet` hides it). Hardening: state also carries `block_unix_nano` (server block) which `Wait` re-checks after sleeping, so a block learned by one process reaches processes already waiting; persisted/header-supplied blocks are clamped to `ratelimit.MaxBlock` (2 min); state files are 0700/0600; plain 500 is retried 3x with the body snippet in `APIError.Detail`; the blocking `flock` has no timeout (a stuck NFS holder would hang callers - keep `$XDG_STATE_HOME` local); on non-unix the limiter is in-process only. `pa` rejects windows < 1 whole second / `from >= to`, handles SIGINT/SIGTERM (closes the output, reports INCOMPLETE), flushes CSV per page.
+
+**Paging caveats (`pa list`)** — verified live, they differ from the documented contract:
+- `from`/`to` are **floored to whole seconds** server-side (`[10500,12500)` behaves as `[10000,12000)`; a window inside one second is a 500). Paging therefore works on the *second* containing the page's last row: desc → next window `[from, floor_s(minTs)+1s)`, asc → `[floor_s(maxTs), to)`. The boundary second is re-fetched and repeats are dropped by exact whole-record match (multiset — identical events are kept).
+- A full page inside **one second** cannot advance → hard error (never loops, never drops rows). Every page is also checked to lie inside the requested window.
+- The API **caches responses by query shape + minute-rounded from/to** (for minutes): the same shape in the same minutes returns another window's result — also for `scalar`/`timeseries`. ddx adds a unique negated nonce term to every request (`(Q) -@ddx_nonce:<hex>`, rebuilt per retry); `--cache-bust=false` disables it.
+- `meta.status`: `done` (or absent) ok; `running` is re-issued (up to 5×, 2s apart); `timeout`/still-running → exit 7 (`async_timeout`). Partial data is never returned as complete.
+- The run ends with `fetched N rows (api total_count M, K boundary repeats removed)` on stderr; a mismatch is reported explicitly.
+
 ### traces
 
 ```bash
@@ -871,6 +910,8 @@ cmd/ddx/main.go              Entry point, version injection, exit codes
 internal/
   client/client.go            HTTP client, DD auth headers, retries, dual pagination
   client/errors.go            APIError with ExitCode(), hints
+  client/ratelimited.go       PostRateLimited — shared-limiter POST with 429/5xx retry
+  ratelimit/                  cross-process flock rate limiter (bucket state under XDG_STATE_HOME)
   commands/root.go            Root command, global flags, getClient()
   commands/confirm.go         requireConfirm()/dryRun() — the write-safety gate
   commands/paginate.go         paginateOffset() — shared offset-pagination loop (v1 start/count, v2 page[offset]/page[size])
@@ -878,6 +919,7 @@ internal/
   commands/logs_config.go      logs metrics/archives/destinations config groups (new)
   commands/metrics_cardinality.go  volumes/estimate/tag-cardinalities/tags/tag-rules (new)
   commands/metrics_scalar.go   metrics scalar (new)
+  commands/pa.go               pa list/scalar/timeseries — Product Analytics (keyset paging, cache-bust)
   commands/teams.go            teams list/get — the api/v2/team surface (new)
   commands/*.go               One file per command group (44 files)
   config/config.go            TOML config, multi-project, credential resolution

@@ -249,6 +249,25 @@ ddx rum metrics list
 ddx rum metrics create --id rum.sessions.web.count --event-type session --compute count --yes
 ```
 
+### `pa` — Product Analytics (unsampled events)
+
+The Product Analytics analytics API reads the **unsampled** event store (15-month retention, raw event grain) — unlike `rum events`, which only sees the ~5% retention-filtered sample. Alias: `product-analytics`. Needs the `rum_apps_read` scope.
+
+```bash
+ddx pa list --query "@type:action" --columns @action.name,@session.id --from 1d --format csv --out actions.csv
+ddx pa list --query "@type:action" --columns @action.name --from 2h --format jsonl | jq -r '."@action.name"'
+ddx pa scalar --query "@type:action" --compute count --group-by @type --from 7d
+ddx pa scalar --query "@type:view" --compute "cardinality(@session.id)" --group-by "@view.name:50" --format csv
+ddx pa timeseries --query "@type:view" --compute "cardinality(@session.id)" --interval 1d --from 14d
+```
+
+- `pa list` — raw rows, keyset-paged and streamed (`--format json|jsonl|csv`, `--sort asc|desc`, `--page-size` ≤1000, `--max-rows`, `--out FILE`). Ends with `rows fetched` vs the API `total_count` on stderr. Under `CLAUDECODE` stdout is capped at 100 rows (stated on stderr) unless `--max-rows N|0` or `--out` is given.
+- `pa scalar` / `pa timeseries` — `--compute count|cardinality(@f)|sum(@f)|avg(@f)|min(@f)|max(@f)`, repeatable `--group-by "@facet[:limit]"` (limit default 20), `--interval` for timeseries; tidy rows (`time`, `time_ms`, group facets, `value`).
+- `--data-source product_analytics|product_analytics_occurrence`, `--format json|csv`.
+- **Shared rate limit**: 60 requests/min per user across *every* process using the same keys. ddx paces all `pa` calls through a cross-process limiter (flock state under `$XDG_STATE_HOME/ddx/ratelimit/`, default 1 call/s; `--min-interval` or `DDX_PA_MIN_INTERVAL`), so parallel agents stay under the limit together, honours `x-ratelimit-*` headers, retries 429/5xx, and prints a stderr note when waiting >2s (`--quiet` hides it).
+- **Safety**: waits and server blocks (`x-ratelimit-remaining: 0`, 429) are shared with processes already sleeping on a slot; persisted blocks are capped at 2 min (clock jumps / bogus headers can't wedge the bucket). A plain HTTP 500 is retried 3x (body shown in the error); 502/503/504/network up to 8x. Ctrl-C/SIGTERM close the output cleanly and report `INCOMPLETE`. The rows-vs-`total_count` mismatch note is printed even with `--quiet`. On Windows the limiter is in-process only (no cross-process guarantee).
+- **Caveats**: windows shorter than one whole second (or `from >= to`) are rejected; rows up to 999 ms outside `--from/--to` can appear (API flooring); columns that do not distinguish events make `rows` mean distinct records under those columns; `--from/--to` are floored to whole seconds by the API (sub-second windows error); a full page inside a single second cannot be paged and fails loudly; the API caches responses by query shape + minute-rounded window, so ddx appends a harmless `-@ddx_nonce:<hex>` term to every query (`--cache-bust=false` to disable).
+
 ### `traces` — APM Traces & Spans
 
 ```bash
