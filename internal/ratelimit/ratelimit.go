@@ -7,8 +7,11 @@ package ratelimit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -22,6 +25,15 @@ import (
 // PABucket is the bucket shared by every Product Analytics analytics call
 // (Datadog: analytics_extended_per_user, 60 requests/min per user).
 const PABucket = "product-analytics"
+
+// PABucketFor returns the PA bucket for one Datadog org/user: the server-side
+// budget is per user, so different sites or credentials must not throttle each
+// other. scope identifies them (base URL + app key); only a short SHA-256 of it
+// is used - the secret itself is never written to disk.
+func PABucketFor(scope string) string {
+	sum := sha256.Sum256([]byte(scope))
+	return PABucket + "-" + hex.EncodeToString(sum[:])[:12]
+}
 
 // DefaultPAInterval is the minimum spacing for the PA bucket (60/min).
 const DefaultPAInterval = time.Second
@@ -57,6 +69,24 @@ type Limiter struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 
 	mu sync.Mutex // serializes in-process callers (flock is per open file description)
+
+	// degraded is set once the on-disk state could not be used (read-only
+	// HOME, unusable dir); from then on mem holds the state, in-process only.
+	degraded bool
+	mem      state
+}
+
+// warnOut receives the one-time "falling back to in-process limiter" warning
+// (var so tests can capture it).
+var (
+	warnOut  io.Writer = os.Stderr
+	warnOnce sync.Once
+)
+
+func warnDegraded(err error) {
+	warnOnce.Do(func() {
+		fmt.Fprintf(warnOut, "warning: ddx rate-limit state is unusable (%v); falling back to an in-process limiter - parallel ddx processes will NOT coordinate\n", err)
+	})
 }
 
 // New returns a limiter for bucket with the given minimum spacing, using the
@@ -65,16 +95,50 @@ func New(bucket string, minInterval time.Duration) *Limiter {
 	return &Limiter{Bucket: bucket, MinInterval: minInterval}
 }
 
-// StateDir returns $XDG_STATE_HOME/ddx/ratelimit, falling back to
-// ~/.local/state/ddx/ratelimit (and the OS temp dir if there is no home).
+// StateDir returns $XDG_STATE_HOME/ddx/ratelimit (only if absolute, per the XDG
+// spec), falling back to ~/.local/state/ddx/ratelimit. With no home at all it
+// uses a per-uid directory under the OS temp dir (ownership and mode are
+// verified before use, see ensureDir).
 func StateDir() string {
-	if x := os.Getenv("XDG_STATE_HOME"); x != "" {
+	if x := os.Getenv("XDG_STATE_HOME"); x != "" && filepath.IsAbs(x) {
 		return filepath.Join(x, "ddx", "ratelimit")
 	}
-	if home, err := os.UserHomeDir(); err == nil {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		return filepath.Join(home, ".local", "state", "ddx", "ratelimit")
 	}
-	return filepath.Join(os.TempDir(), "ddx-ratelimit")
+	return filepath.Join(os.TempDir(), fmt.Sprintf("ddx-ratelimit-%d", os.Getuid()))
+}
+
+// ensureDir creates d (0700) and verifies it is a real directory (not a
+// symlink) owned by the current user, tightening its mode to 0700 if needed.
+func ensureDir(d string) error {
+	if err := os.MkdirAll(d, 0o700); err != nil {
+		return err
+	}
+	fi, err := os.Lstat(d)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", d)
+	}
+	if !ownedByUs(fi) {
+		return fmt.Errorf("%s is not owned by the current user", d)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		// Best effort: some mounts (vfat, FUSE, squashed NFS) cannot chmod yet
+		// work fine. Only the shared-temp fallback must be exactly 0700.
+		cerr := os.Chmod(d, 0o700)
+		if filepath.Dir(d) == filepath.Clean(os.TempDir()) {
+			if cerr != nil {
+				return cerr
+			}
+			if fi2, err := os.Lstat(d); err != nil || fi2.Mode().Perm() != 0o700 {
+				return fmt.Errorf("%s is not mode 0700", d)
+			}
+		}
+	}
+	return nil
 }
 
 // IntervalFromEnv parses a Go duration from env var name; def is returned when
@@ -108,7 +172,7 @@ func (l *Limiter) dir() string {
 
 func (l *Limiter) paths() (lock, st string, err error) {
 	d := l.dir()
-	if err := os.MkdirAll(d, 0o700); err != nil {
+	if err := ensureDir(d); err != nil {
 		return "", "", fmt.Errorf("ratelimit state dir: %w", err)
 	}
 	name := sanitize(l.Bucket)
@@ -126,17 +190,38 @@ func sanitize(s string) string {
 }
 
 // update runs fn under the cross-process lock with the current state and
-// persists whatever fn leaves in it.
+// persists whatever fn leaves in it. If the state directory cannot be used
+// (read-only HOME, container, foreign-owned dir) it warns once on stderr and
+// falls back to an in-process state, like platforms without flock.
 func (l *Limiter) update(fn func(s *state)) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if !l.degraded {
+		applied, err := l.updateDisk(fn)
+		if err == nil {
+			return nil
+		}
+		warnDegraded(err)
+		l.degraded = true
+		if applied != nil {
+			l.mem = *applied // fn already ran on the disk copy: do not apply it twice
+			return nil
+		}
+	}
+	fn(&l.mem)
+	return nil
+}
+
+// updateDisk returns (nil, err) when fn was NOT applied, or (&state, err) when
+// fn was applied but the new state could not be persisted.
+func (l *Limiter) updateDisk(fn func(s *state)) (*state, error) {
 	lockPath, statePath, err := l.paths()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	unlock, err := lockFile(lockPath)
 	if err != nil {
-		return fmt.Errorf("ratelimit lock: %w", err)
+		return nil, fmt.Errorf("ratelimit lock: %w", err)
 	}
 	defer unlock()
 
@@ -146,11 +231,25 @@ func (l *Limiter) update(fn func(s *state)) error {
 	}
 	fn(&s)
 	b, _ := json.Marshal(s)
-	tmp := statePath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return fmt.Errorf("ratelimit state: %w", err)
+	// CreateTemp (O_EXCL, 0600, random name) in the same dir: never follows a
+	// pre-planted symlink, and the rename below stays atomic.
+	f, err := os.CreateTemp(filepath.Dir(statePath), filepath.Base(statePath)+".*.tmp")
+	if err != nil {
+		return &s, fmt.Errorf("ratelimit state: %w", err)
 	}
-	return os.Rename(tmp, statePath)
+	tmp := f.Name()
+	_, werr := f.Write(b)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Rename(tmp, statePath)
+	}
+	if werr != nil {
+		os.Remove(tmp)
+		return &s, fmt.Errorf("ratelimit state: %w", werr)
+	}
+	return nil, nil
 }
 
 // Wait reserves the next free slot and sleeps until it arrives. The slot is

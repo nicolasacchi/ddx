@@ -1,6 +1,6 @@
 # ddx
 
-CLI for the [Datadog](https://www.datadoghq.com/) API. 34 command groups covering logs, metrics, traces, monitors, incidents, error tracking, RUM, APM, **continuous profiler**, usage/cost billing, notebooks, and more — with SQL-style log analysis (HAVING, DATE_TRUNC, multiple aggregates), multi-metric formulas and scalar queries, custom-metric cardinality cost control, APM latency percentiles (p50/p75/p99) and full trace waterfalls, profiler flame-graph aggregation, and parallel health snapshots. Pairs with the [Datadog MCP server](https://docs.datadoghq.com/bits_ai/mcp_server/) for log SQL JOINs — RUM aggregation and trace waterfalls are native now.
+CLI for the [Datadog](https://www.datadoghq.com/) API. 35 command groups covering logs, metrics, traces, monitors, incidents, error tracking, RUM, APM, **continuous profiler**, usage/cost billing, notebooks, and more — with SQL-style log analysis (HAVING, DATE_TRUNC, multiple aggregates), multi-metric formulas and scalar queries, custom-metric cardinality cost control, APM latency percentiles (p50/p75/p99) and full trace waterfalls, profiler flame-graph aggregation, and parallel health snapshots. Pairs with the [Datadog MCP server](https://docs.datadoghq.com/bits_ai/mcp_server/) for log SQL JOINs — RUM aggregation and trace waterfalls are native now.
 
 ## Install
 
@@ -80,7 +80,7 @@ Switch projects: `ddx --project staging monitors list`
 
 ### Required App Key Scopes
 
-`logs_read_data`, `metrics_read`, `monitors_read`, `dashboards_read`, `incidents_read`, `rum_read`, `hosts_read`, `timeseries_query`
+`logs_read_data`, `metrics_read`, `monitors_read`, `dashboards_read`, `incidents_read`, `rum_read`, `hosts_read`, `timeseries_query`, `rum_apps_read` (for `pa`)
 
 ## Global Flags
 
@@ -262,11 +262,11 @@ ddx pa timeseries --query "@type:view" --compute "cardinality(@session.id)" --in
 ```
 
 - `pa list` — raw rows, keyset-paged and streamed (`--format json|jsonl|csv`, `--sort asc|desc`, `--page-size` ≤1000, `--max-rows`, `--out FILE`). Ends with `rows fetched` vs the API `total_count` on stderr. Under `CLAUDECODE` stdout is capped at 100 rows (stated on stderr) unless `--max-rows N|0` or `--out` is given.
-- `pa scalar` / `pa timeseries` — `--compute count|cardinality(@f)|sum(@f)|avg(@f)|min(@f)|max(@f)`, repeatable `--group-by "@facet[:limit]"` (limit default 20), `--interval` for timeseries; tidy rows (`time`, `time_ms`, group facets, `value`).
+- `pa scalar` / `pa timeseries` — `--compute count|cardinality(@f)|sum(@f)|avg(@f)|min(@f)|max(@f)`, repeatable `--group-by "@facet[:limit]"` (limit default 20; a stderr note, even with `--quiet`, says when a facet hit its limit), `--interval` for timeseries (the API's trailing bucket at/after `--to` is dropped); tidy rows (`time`, `time_ms`, group facets, `value`).
 - `--data-source product_analytics|product_analytics_occurrence`, `--format json|csv`.
-- **Shared rate limit**: 60 requests/min per user across *every* process using the same keys. ddx paces all `pa` calls through a cross-process limiter (flock state under `$XDG_STATE_HOME/ddx/ratelimit/`, default 1 call/s; `--min-interval` or `DDX_PA_MIN_INTERVAL`), so parallel agents stay under the limit together, honours `x-ratelimit-*` headers, retries 429/5xx, and prints a stderr note when waiting >2s (`--quiet` hides it).
-- **Safety**: waits and server blocks (`x-ratelimit-remaining: 0`, 429) are shared with processes already sleeping on a slot; persisted blocks are capped at 2 min (clock jumps / bogus headers can't wedge the bucket). A plain HTTP 500 is retried 3x (body shown in the error); 502/503/504/network up to 8x. Ctrl-C/SIGTERM close the output cleanly and report `INCOMPLETE`. The rows-vs-`total_count` mismatch note is printed even with `--quiet`. On Windows the limiter is in-process only (no cross-process guarantee).
-- **Caveats**: windows shorter than one whole second (or `from >= to`) are rejected; rows up to 999 ms outside `--from/--to` can appear (API flooring); columns that do not distinguish events make `rows` mean distinct records under those columns; `--from/--to` are floored to whole seconds by the API (sub-second windows error); a full page inside a single second cannot be paged and fails loudly; the API caches responses by query shape + minute-rounded window, so ddx appends a harmless `-@ddx_nonce:<hex>` term to every query (`--cache-bust=false` to disable).
+- **Shared rate limit**: 60 requests/min per user across *every* process using the same keys. ddx paces all `pa` calls through a cross-process limiter (flock state under `$XDG_STATE_HOME/ddx/ratelimit/`, one bucket per site+app key, default 1 call/s; `--min-interval` (0 disables spacing) or `DDX_PA_MIN_INTERVAL`; if the state dir is unwritable ddx warns once and falls back to an in-process limiter), so parallel agents stay under the limit together, honours `x-ratelimit-*` headers, retries 429/5xx, and prints a stderr note when waiting >2s (`--quiet` hides it).
+- **Safety**: waits and server blocks (`x-ratelimit-remaining: 0`, 429) are shared with processes already sleeping on a slot; persisted blocks are capped at 2 min (clock jumps / bogus headers can't wedge the bucket). A plain HTTP 500 gets 3 attempts in total (body shown in the error); 502/503/504/network up to 8 attempts in total. Ctrl-C/SIGTERM close the output cleanly and report `INCOMPLETE`; a mid-stream `pa list` failure is reported on stderr only, so stdout stays a valid document. The rows-vs-`total_count` mismatch note is printed even with `--quiet`. On Windows the limiter is in-process only (no cross-process guarantee).
+- **Caveats**: windows shorter than one whole second (or `from >= to`) are rejected; the API floors the window edges to whole seconds, so rows in the partial last second before `--to` can be dropped, and a sub-second `--from` is floored and can add rows up to 999 ms before it; columns that do not distinguish events make `rows` mean distinct records under those columns; `--from/--to` are floored to whole seconds by the API (sub-second windows error); a full page inside a single second cannot be paged and fails loudly; the API caches responses by query shape + minute-rounded window, so ddx appends a harmless `-@ddx_nonce:<hex>` term to every query (`--cache-bust=false` to disable).
 
 ### `traces` — APM Traces & Spans
 

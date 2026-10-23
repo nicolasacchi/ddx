@@ -1,6 +1,6 @@
 # CLAUDE.md — ddx
 
-Go CLI for Datadog. Single binary, JSON output, API key + App key auth. 34 command groups, SQL log parser, multi-metric formulas + scalar queries, custom-metric cardinality cost control, APM stats, **continuous-profiler aggregation** (flame graph + per-endpoint hotspots + per-version diff), full trace waterfalls, Usage Metering v2 + cost attribution billing visibility. Scores 84/90 in empirical comparison — primary Datadog tool alongside MCP (70/90) for log SQL JOINs.
+Go CLI for Datadog. Single binary, JSON output, API key + App key auth. 35 command groups, SQL log parser, multi-metric formulas + scalar queries, custom-metric cardinality cost control, APM stats, **continuous-profiler aggregation** (flame graph + per-endpoint hotspots + per-version diff), full trace waterfalls, Usage Metering v2 + cost attribution billing visibility. Scores 84/90 in empirical comparison — primary Datadog tool alongside MCP (70/90) for log SQL JOINs.
 
 **API**: Datadog REST API v1/v2. Base URL derived from `DD_SITE`: `datadoghq.eu` → `https://api.datadoghq.eu`.
 
@@ -12,7 +12,7 @@ Resolution order (first non-empty wins):
 2. `DD_API_KEY` / `DD_APP_KEY` / `DD_SITE` env vars
 3. `~/.config/ddx/config.toml` — project from `--project` flag, then `default_project`
 
-Required App Key scopes: `logs_read_data`, `metrics_read`, `monitors_read`, `dashboards_read`, `incidents_read`, `rum_read`, `hosts_read`, `timeseries_query`.
+Required App Key scopes: `logs_read_data`, `metrics_read`, `monitors_read`, `dashboards_read`, `incidents_read`, `rum_read`, `hosts_read`, `timeseries_query`, `rum_apps_read` (for `pa`).
 
 ### Multi-project config
 
@@ -444,7 +444,7 @@ Alias `product-analytics`. The **unsampled** event store (15-month retention, ra
 |------|-----------|---------|-------------|
 | `--query` | all | `*` | Product Analytics search query |
 | `--data-source` | all | `product_analytics` | or `product_analytics_occurrence` |
-| `--min-interval` | all | `1s` (`DDX_PA_MIN_INTERVAL`) | Minimum spacing of API calls across ALL ddx processes |
+| `--min-interval` | all | `1s` (`DDX_PA_MIN_INTERVAL`) | Minimum spacing of API calls across ALL ddx processes. An explicit `0` disables spacing (also when the env is set); negative is rejected |
 | `--cache-bust` | all | true | Append `-@ddx_nonce:<hex>` so the API response cache cannot serve stale data |
 | `--columns` | list | — | Comma-separated columns (required); `timestamp` is always returned |
 | `--sort` | list | `desc` | `asc` or `desc` |
@@ -453,15 +453,15 @@ Alias `product-analytics`. The **unsampled** event store (15-month retention, ra
 | `--format` | all | `json` | list: `json` (streamed array) / `jsonl` / `csv`; scalar/timeseries: `json` / `csv` |
 | `--out` | list | — | Write rows to a file (never agent-capped) |
 | `--compute` | scalar, timeseries | `count` | `count`, `cardinality(@f)`, `sum(@f)`, `avg(@f)`, `min(@f)`, `max(@f)` |
-| `--group-by` | scalar, timeseries | — | `@facet[:limit]` (limit default 20), repeatable |
+| `--group-by` | scalar, timeseries | — | `@facet[:limit]` (limit default 20), repeatable. When a facet has as many distinct values as its limit, a stderr note (not silenced by `--quiet`) says more groups may exist |
 | `--interval` | timeseries | `1h` | Go duration or `1d`/`1w` |
 
-**Rate limit** (`internal/ratelimit`, generic — `client.PostRateLimited` takes any bucket): the API allows 60 req/min **per user** (`x-ratelimit-name: analytics_extended_per_user`), shared by every process on the same keys. State lives in `$XDG_STATE_HOME/ddx/ratelimit/<bucket>.{lock,json}` (fallback `~/.local/state/…`); `<bucket>.json` is `{"next_unix_nano": N}`, mutated under `flock` on `<bucket>.lock`. Each call *reserves* the next slot (`max(now,next)` → `next = slot + interval`) under the lock then sleeps outside it. `x-ratelimit-remaining: 0` blocks the bucket until `x-ratelimit-reset`; 429 blocks it until reset (+≤250ms jitter) and retries (max 8 tries); 5xx/network errors back off 1s,2s,4s… (cap 30s); other 4xx return the API error. A stderr note is printed when a wait exceeds 2s (`--quiet` hides it). Hardening: state also carries `block_unix_nano` (server block) which `Wait` re-checks after sleeping, so a block learned by one process reaches processes already waiting; persisted/header-supplied blocks are clamped to `ratelimit.MaxBlock` (2 min); state files are 0700/0600; plain 500 is retried 3x with the body snippet in `APIError.Detail`; the blocking `flock` has no timeout (a stuck NFS holder would hang callers - keep `$XDG_STATE_HOME` local); on non-unix the limiter is in-process only. `pa` rejects windows < 1 whole second / `from >= to`, handles SIGINT/SIGTERM (closes the output, reports INCOMPLETE), flushes CSV per page.
+**Rate limit** (`internal/ratelimit`, generic — `client.PostRateLimited` takes any bucket): the API allows 60 req/min **per user** (`x-ratelimit-name: analytics_extended_per_user`), shared by every process on the same keys. State lives in `$XDG_STATE_HOME/ddx/ratelimit/<bucket>.{lock,json}` (`XDG_STATE_HOME` is used only if absolute; fallback `~/.local/state/…`, and with no home a per-uid `$TMPDIR/ddx-ratelimit-<uid>`); the `pa` bucket is `product-analytics-<12 hex of sha256(base URL + app key)>` so different orgs/credentials do not throttle each other (the key itself is never written); the state dir must be a real directory owned by us (else treated as unusable); `<bucket>.json` is `{"next_unix_nano": N}`, mutated under `flock` on `<bucket>.lock`. Each call *reserves* the next slot (`max(now,next)` → `next = slot + interval`) under the lock then sleeps outside it. `x-ratelimit-remaining: 0` blocks the bucket until `x-ratelimit-reset`; 429 blocks it until reset (+≤250ms jitter) and retries (max 8 tries); 5xx/network errors back off 1s,2s,4s… (cap 30s); other 4xx return the API error. A stderr note is printed when a wait exceeds 2s (`--quiet` hides it). Hardening: state also carries `block_unix_nano` (server block) which `Wait` re-checks after sleeping, so a block learned by one process reaches processes already waiting; persisted/header-supplied blocks are clamped to `ratelimit.MaxBlock` (2 min); the state dir is created 0700 and the state files 0600 (existing ones owned by us are chmod'ed to match; the state file is written via `os.CreateTemp` in the same dir + rename, never through a symlink); a plain 500 gets 3 attempts in total, with the body snippet in `APIError.Detail`; if the state dir is unusable (read-only HOME, container) ddx prints ONE stderr warning and falls back to the in-process limiter; the blocking `flock` has no timeout (a stuck NFS holder would hang callers - keep `$XDG_STATE_HOME` local); on non-unix the limiter is in-process only. `pa` rejects windows < 1 whole second / `from >= to`, handles SIGINT/SIGTERM (closes the output, reports INCOMPLETE), flushes json/jsonl/csv per page (buffered writes). A `pa list` failure after output went to stdout is wrapped in `commands.StreamedError`: `main` reports it on stderr only (same exit code), so stdout stays a valid json/jsonl/csv document. With `--max-rows`, each page requests `min(page-size, remaining + boundary repeats + 1)` (the +1 makes a full page prove more rows exist, so "truncated" is exact). `pa timeseries` drops the API's trailing bucket at/after `--to`.
 
 **Paging caveats (`pa list`)** — verified live, they differ from the documented contract:
 - `from`/`to` are **floored to whole seconds** server-side (`[10500,12500)` behaves as `[10000,12000)`; a window inside one second is a 500). Paging therefore works on the *second* containing the page's last row: desc → next window `[from, floor_s(minTs)+1s)`, asc → `[floor_s(maxTs), to)`. The boundary second is re-fetched and repeats are dropped by exact whole-record match (multiset — identical events are kept).
 - A full page inside **one second** cannot advance → hard error (never loops, never drops rows). Every page is also checked to lie inside the requested window.
-- The API **caches responses by query shape + minute-rounded from/to** (for minutes): the same shape in the same minutes returns another window's result — also for `scalar`/`timeseries`. ddx adds a unique negated nonce term to every request (`(Q) -@ddx_nonce:<hex>`, rebuilt per retry); `--cache-bust=false` disables it.
+- The API **caches responses by query shape + minute-rounded from/to** (for minutes): the same shape in the same minutes returns another window's result — also for `scalar`/`timeseries`. ddx adds a unique negated nonce term to every request (`(Q) -@ddx_nonce:<hex>`); one nonce per logical request - transport retries AND `running` re-polls resend the identical body (a fresh nonce would be a new query and could restart the server computation); `--cache-bust=false` disables it.
 - `meta.status`: `done` (or absent) ok; `running` is re-issued (up to 5×, 2s apart); `timeout`/still-running → exit 7 (`async_timeout`). Partial data is never returned as complete.
 - The run ends with `fetched N rows (api total_count M, K boundary repeats removed)` on stderr; a mismatch is reported explicitly.
 
@@ -921,7 +921,7 @@ internal/
   commands/metrics_scalar.go   metrics scalar (new)
   commands/pa.go               pa list/scalar/timeseries — Product Analytics (keyset paging, cache-bust)
   commands/teams.go            teams list/get — the api/v2/team surface (new)
-  commands/*.go               One file per command group (44 files)
+  commands/*.go               One file per command group (45 files)
   config/config.go            TOML config, multi-project, credential resolution
   output/output.go            JSON/table dispatcher, TTY detection
   output/table.go             go-pretty table rendering, column definitions

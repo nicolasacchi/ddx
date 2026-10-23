@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -288,5 +289,135 @@ func TestHelperProcess(t *testing.T) {
 			t.Fatal(err)
 		}
 		fmt.Println(time.Now().UnixNano())
+	}
+}
+
+func TestUnusableStateDirFallsBackInProcessWithOneWarning(t *testing.T) {
+	// A regular file as the parent makes MkdirAll fail, like a read-only HOME.
+	blocker := t.TempDir() + "/file"
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var warn strings.Builder
+	oldW := warnOut
+	warnOut, warnOnce = &warn, sync.Once{}
+	defer func() { warnOut, warnOnce = oldW, sync.Once{} }()
+
+	now := time.Unix(1_000_000, 0)
+	var slept []time.Duration
+	l := fakeLimiter(blocker+"/sub", &now, &slept)
+	for i := 0; i < 3; i++ {
+		if err := l.Wait(context.Background()); err != nil {
+			t.Fatalf("Wait %d: %v", i, err)
+		}
+	}
+	// Still spaced in-process: 2nd and 3rd calls waited 1s each.
+	if len(slept) != 2 || slept[0] != time.Second || slept[1] != time.Second {
+		t.Fatalf("slept %v, want [1s 1s] from the in-process fallback", slept)
+	}
+	if got := strings.Count(warn.String(), "warning:"); got != 1 {
+		t.Fatalf("warnings = %d (%q), want exactly 1", got, warn.String())
+	}
+}
+
+func TestStateDirIgnoresRelativeXDGAndTempFallbackIsPerUID(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "relative/state")
+	t.Setenv("HOME", "")
+	got := StateDir()
+	if !filepath.IsAbs(got) || strings.Contains(got, "relative") {
+		t.Fatalf("StateDir() = %q, relative XDG_STATE_HOME must be ignored", got)
+	}
+	if want := fmt.Sprintf("ddx-ratelimit-%d", os.Getuid()); !strings.HasSuffix(got, want) {
+		t.Fatalf("StateDir() = %q, want suffix %q when HOME is unset", got, want)
+	}
+	t.Setenv("XDG_STATE_HOME", "/abs/state")
+	if got := StateDir(); got != "/abs/state/ddx/ratelimit" {
+		t.Fatalf("StateDir() = %q", got)
+	}
+}
+
+func TestEnsureDirRejectsSymlinkAndTightensMode(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDir(link); err == nil {
+		t.Fatal("symlinked state dir must be rejected")
+	}
+	if err := ensureDir(real); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(real); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("mode = %v, want 0700", fi.Mode().Perm())
+	}
+}
+
+func TestExistingStateFilesAreTightenedAndSymlinkedTmpIgnored(t *testing.T) {
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "b.lock")
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A pre-planted symlink at the old predictable tmp name must not be followed.
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.Symlink(victim, filepath.Join(dir, "b.json.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	l := &Limiter{Bucket: "b", Dir: dir, MinInterval: time.Millisecond}
+	if err := l.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(lock); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("lock mode = %v, want 0600", fi.Mode().Perm())
+	}
+	if _, err := os.Stat(victim); err == nil {
+		t.Fatal("tmp write followed a symlink")
+	}
+	if l.degraded {
+		t.Fatal("limiter degraded unexpectedly")
+	}
+}
+
+func TestPABucketForIsPerCredentialAndHidesKey(t *testing.T) {
+	a, b := PABucketFor("https://api.datadoghq.eu\x00key1"), PABucketFor("https://api.datadoghq.com\x00key1")
+	c := PABucketFor("https://api.datadoghq.eu\x00key2")
+	if a == b || a == c || a != PABucketFor("https://api.datadoghq.eu\x00key1") {
+		t.Fatalf("buckets not keyed by site+key: %s %s %s", a, b, c)
+	}
+	if !strings.HasPrefix(a, PABucket+"-") || strings.Contains(a, "key1") || sanitize(a) != a {
+		t.Fatalf("bucket %q leaks the key or is not filename-safe", a)
+	}
+}
+
+func TestUnsavableStateStillSpacesAndWarnsOnce(t *testing.T) {
+	dir := t.TempDir()
+	// A non-empty directory where the state file belongs: lock works, the
+	// rename of the temp file onto it fails.
+	if err := os.MkdirAll(dir+"/f.json/x", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var warn strings.Builder
+	oldW := warnOut
+	warnOut, warnOnce = &warn, sync.Once{}
+	defer func() { warnOut, warnOnce = oldW, sync.Once{} }()
+
+	now := time.Unix(1_000_000, 0)
+	var slept []time.Duration
+	l := fakeLimiter(dir, &now, &slept)
+	for i := 0; i < 3; i++ {
+		if err := l.Wait(context.Background()); err != nil {
+			t.Fatalf("Wait %d: %v", i, err)
+		}
+	}
+	if len(slept) != 2 || slept[0] != time.Second || slept[1] != time.Second {
+		t.Fatalf("slept %v, want [1s 1s] (update must not be applied twice)", slept)
+	}
+	if got := strings.Count(warn.String(), "warning:"); got != 1 {
+		t.Fatalf("warnings = %d (%q), want exactly 1", got, warn.String())
 	}
 }

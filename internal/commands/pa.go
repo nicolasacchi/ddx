@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	crand "crypto/rand"
@@ -72,7 +73,7 @@ func init() {
 	paCmd.PersistentFlags().StringVar(&paDataSourceFlag, "data-source", "product_analytics", "Data source: product_analytics or product_analytics_occurrence")
 	paCmd.PersistentFlags().StringVar(&paQueryFlag, "query", "*", `Product Analytics search query, e.g. "@type:action @action.name:\"Add to cart\""`)
 	paCmd.PersistentFlags().BoolVar(&paCacheBustFlag, "cache-bust", true, "Make every request unique so the API's response cache (keyed on query shape + minute-rounded window) cannot serve stale data")
-	paCmd.PersistentFlags().DurationVar(&paMinIntervalFlag, "min-interval", 0, "Minimum spacing between API calls across ALL ddx processes (default 1s = 60/min; env DDX_PA_MIN_INTERVAL)")
+	paCmd.PersistentFlags().DurationVar(&paMinIntervalFlag, "min-interval", 0, "Minimum spacing between API calls across ALL ddx processes (default 1s = 60/min; env DDX_PA_MIN_INTERVAL; 0 disables spacing; negative is rejected)")
 
 	paListCmd.Flags().StringVar(&paColumnsFlag, "columns", "", "Comma-separated columns to return, e.g. @action.name,@session.id,@view.name (required; timestamp is always included)")
 	paListCmd.Flags().StringVar(&paSortFlag, "sort", "desc", "Timestamp order: asc or desc")
@@ -135,8 +136,10 @@ Paging caveats (why this is not offset paging):
   - Include enough columns to tell records apart; the dedupe key is the whole
     returned record (requested columns + timestamp). Columns that do not
     distinguish events make "rows" mean "distinct records under those columns".
-  - Rows up to 999 ms before --from / after --to may appear: the API floors the
-    window edges to whole seconds and ddx reports what it returns.
+  - The API floors the window edges to whole seconds, so rows in the partial
+    last second before --to can be DROPPED: --to 12:00:00.700 behaves as
+    12:00:00.000. Conversely --from is floored too, so --from 12:00:00.700
+    behaves as 12:00:00.000 and can ADD rows up to 999 ms before it.
   - A window shorter than one whole second (or from >= to) is rejected.
   - The API caches responses by query shape + MINUTE-rounded from/to, so the
     same shape in the same minutes returns a stale, different-window result
@@ -201,7 +204,7 @@ Examples:
 			return err
 		}
 		paWireNotify(c)
-		rl, err := paNewLimiter()
+		rl, err := paNewLimiter(cmd, c)
 		if err != nil {
 			return err
 		}
@@ -227,16 +230,16 @@ Examples:
 		// (JSON array terminated, CSV flushed) and the summary reports INCOMPLETE.
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		fetch := func(ctx context.Context, f, t int64) (paPage, error) {
+		fetch := func(ctx context.Context, f, t int64, limit int) (paPage, error) {
 			return paFetchList(ctx, c, rl, paListSpec{
 				DataSource: paDataSourceFlag, Query: paQueryFlag, Columns: columns,
-				Limit: paPageSizeFlag, Desc: paSortFlag == "desc", From: f, To: t,
+				Limit: limit, Desc: paSortFlag == "desc", From: f, To: t,
 				Bust: paCacheBustFlag,
 			})
 		}
 		stats, perr := paPaginate(ctx, paPagerOpts{
 			From: from, To: to, Desc: paSortFlag == "desc", PageSize: paPageSizeFlag, MaxRows: maxRows,
-			Fetch: fetch, Emit: rw.Write,
+			Fetch: fetch, Emit: rw.Write, CacheBust: paCacheBustFlag,
 			Progress: func(s paStats) {
 				if err := rw.Flush(); err != nil && !quietFlag {
 					fmt.Fprintf(os.Stderr, "pa list: flush: %v\n", err)
@@ -246,8 +249,13 @@ Examples:
 				}
 			},
 		})
-		if cerr := rw.Close(); cerr != nil && perr == nil {
-			perr = cerr
+		// A failure before any row was written to stdout leaves nothing to
+		// terminate: skip Close (no "[]"/CSV header that looks like an empty
+		// result) and let main print the normal error envelope.
+		if outFile != nil || stats.Rows > 0 || perr == nil {
+			if cerr := rw.Close(); cerr != nil && perr == nil {
+				perr = cerr
+			}
 		}
 		if outFile != nil {
 			// Explicit close: a deferred one would hide write errors (full disk).
@@ -259,6 +267,11 @@ Examples:
 			}
 		}
 		paReportSummary(stats, perr)
+		if perr != nil && outFile == nil && stats.Rows > 0 {
+			// stdout already carries the (closed) stream: main must not append
+			// a JSON error envelope to it.
+			perr = &StreamedError{Err: perr}
+		}
 		if perr == nil && stats.Truncated {
 			if capNote != "" {
 				fmt.Fprintln(os.Stderr, capNote)
@@ -274,6 +287,10 @@ var paScalarCmd = &cobra.Command{
 	Short: "One aggregated number per group (count, cardinality, sum, avg, min, max)",
 	Long: `Aggregate Product Analytics events into one value per group.
 
+--group-by returns the top N groups per facet (default 20, "@facet:N" to change).
+When a facet reaches its limit ddx prints a stderr note (even with --quiet)
+because more groups may exist.
+
 Examples:
   ddx pa scalar --query "@type:action" --compute count --group-by @type --from 7d
   ddx pa scalar --query "@type:view" --compute "cardinality(@session.id)" --from 1d
@@ -287,7 +304,8 @@ var paTimeseriesCmd = &cobra.Command{
 	Use:   "timeseries",
 	Short: "Aggregated values per time bucket (and group)",
 	Long: `Aggregate Product Analytics events per time bucket. Rows are
-(time, time_ms, <group facets...>, value).
+(time, time_ms, <group facets...>, value). The API also returns a trailing
+bucket starting at/after --to (always null); ddx drops buckets with time >= --to.
 
 Examples:
   ddx pa timeseries --query "@type:action" --interval 1h --from 24h
@@ -365,7 +383,7 @@ func paRunAnalytics(cmd *cobra.Command, path string, timeseries bool) error {
 		return err
 	}
 	paWireNotify(c)
-	rl, err := paNewLimiter()
+	rl, err := paNewLimiter(cmd, c)
 	if err != nil {
 		return err
 	}
@@ -380,7 +398,7 @@ func paRunAnalytics(cmd *cobra.Command, path string, timeseries bool) error {
 	}
 	var rows []map[string]any
 	if timeseries {
-		rows, err = paTimeseriesRows(raw)
+		rows, err = paTimeseriesRows(raw, toS*1000)
 	} else {
 		rows, err = paScalarRows(raw)
 	}
@@ -389,6 +407,10 @@ func paRunAnalytics(cmd *cobra.Command, path string, timeseries bool) error {
 	}
 	if rows == nil {
 		rows = []map[string]any{}
+	}
+	// A data-integrity warning, not progress: never silenced by --quiet.
+	for _, n := range paGroupLimitNotes(rows, groups) {
+		fmt.Fprintln(os.Stderr, n)
 	}
 	if paFormatFlag == "csv" {
 		return paWriteRowsCSV(os.Stdout, rows)
@@ -404,22 +426,32 @@ func paRunAnalytics(cmd *cobra.Command, path string, timeseries bool) error {
 
 // ---------------------------------------------------------------- limiter
 
-func paNewLimiter() (*ratelimit.Limiter, error) {
-	interval := paMinIntervalFlag
-	if interval == 0 {
-		var err error
-		interval, err = ratelimit.IntervalFromEnv("DDX_PA_MIN_INTERVAL", ratelimit.DefaultPAInterval)
-		if err != nil {
-			return nil, err
-		}
+func paNewLimiter(cmd *cobra.Command, c *client.Client) (*ratelimit.Limiter, error) {
+	interval, err := paResolveInterval(cmd.Flags().Changed("min-interval"), paMinIntervalFlag)
+	if err != nil {
+		return nil, err
 	}
-	rl := ratelimit.New(ratelimit.PABucket, interval)
+	// The server budget is per user, so the bucket is keyed by site + app key
+	// (hashed): different orgs/credentials do not throttle each other.
+	rl := ratelimit.New(ratelimit.PABucketFor(c.RateLimitScope()), interval)
 	rl.Notify = func(wait time.Duration) {
 		if !quietFlag {
 			fmt.Fprintf(os.Stderr, "pa: waiting %s for the shared Product Analytics rate limit (60 req/min per user)\n", wait.Round(100*time.Millisecond))
 		}
 	}
 	return rl, nil
+}
+
+// paResolveInterval: an explicitly passed --min-interval wins (0 disables
+// spacing, negative is rejected); otherwise DDX_PA_MIN_INTERVAL, then 1s.
+func paResolveInterval(flagSet bool, flagVal time.Duration) (time.Duration, error) {
+	if flagSet {
+		if flagVal < 0 {
+			return 0, fmt.Errorf("invalid --min-interval %s: must be >= 0 (0 disables spacing)", flagVal)
+		}
+		return flagVal, nil
+	}
+	return ratelimit.IntervalFromEnv("DDX_PA_MIN_INTERVAL", ratelimit.DefaultPAInterval)
 }
 
 // ---------------------------------------------------------------- requests
@@ -454,6 +486,9 @@ var paNonce = func() string {
 // for minutes, even for a different window). Appending a negated match on a
 // nonexistent facet changes the shape without changing the result set.
 func paBustQuery(query, nonce string) string {
+	if strings.TrimSpace(query) == "" {
+		query = "*" // an empty query would become "() -@ddx_nonce:x"
+	}
 	if nonce == "" {
 		return query
 	}
@@ -560,7 +595,7 @@ func paParseGroupBys(specs []string) ([]paGroup, error) {
 	for _, s := range specs {
 		g := paGroup{Facet: strings.TrimSpace(s), Limit: paDefaultGroupLim}
 		if i := strings.LastIndex(s, ":"); i > 0 {
-			if n, err := strconv.Atoi(s[i+1:]); err == nil {
+			if n, err := strconv.Atoi(strings.TrimSpace(s[i+1:])); err == nil {
 				if n < 1 {
 					return nil, fmt.Errorf("invalid --group-by %q: limit must be >= 1", s)
 				}
@@ -573,6 +608,41 @@ func paParseGroupBys(specs []string) ([]paGroup, error) {
 		out = append(out, g)
 	}
 	return out, nil
+}
+
+// paGroupLimitNotes reports every group-by facet whose number of distinct
+// values reached its limit: the API returns only the top N groups, so the
+// result is then possibly incomplete.
+func paGroupLimitNotes(rows []map[string]any, groups []paGroup) []string {
+	var notes []string
+	for i, g := range groups {
+		// Distinct values of this facet within each combination of the outer
+		// facets: a nested group-by limit applies per parent, not globally.
+		perParent := map[string]map[string]bool{}
+		for _, r := range rows {
+			v, ok := r[g.Facet]
+			if !ok {
+				continue
+			}
+			var parent strings.Builder
+			for _, o := range groups[:i] {
+				parent.WriteString(paCell(r[o.Facet]))
+				parent.WriteByte(0)
+			}
+			k := parent.String()
+			if perParent[k] == nil {
+				perParent[k] = map[string]bool{}
+			}
+			perParent[k][paCell(v)] = true
+		}
+		for _, d := range perParent {
+			if len(d) >= g.Limit {
+				notes = append(notes, fmt.Sprintf("note: group %s hit its limit (%d); more groups may exist - use %s:N to raise it", g.Facet, g.Limit, g.Facet))
+				break
+			}
+		}
+	}
+	return notes
 }
 
 // paParseInterval accepts Go durations plus d/w suffixes (1d, 2w).
@@ -599,8 +669,19 @@ func paParseInterval(s string) (time.Duration, error) {
 // running afterwards) fails — partial data is never returned as complete.
 func paPost(ctx context.Context, c *client.Client, rl *ratelimit.Limiter, path string, mkBody func() any) (json.RawMessage, error) {
 	var lastStatus string
+	// One body (and so one nonce) for every re-poll of this logical request: a
+	// fresh nonce would be a NEW query and could restart the server computation.
+	body := mkBody()
+	var firstID string
+	sameID := true
 	for try := 0; try <= paRunningRetries; try++ {
-		raw, err := c.PostRateLimited(ctx, path, mkBody(), rl) // rebuilt per try: a fresh nonce also dodges a cached "running"
+		if try == paRunningRetries && sameID && firstID != "" {
+			// Every re-poll came back "running" with the same request_id: the
+			// API may be serving a cached "running" body, so make the final
+			// attempt a NEW query (fresh nonce).
+			body = mkBody()
+		}
+		raw, err := c.PostRateLimited(ctx, path, body, rl)
 		if err != nil {
 			return nil, err
 		}
@@ -616,6 +697,11 @@ func paPost(ctx context.Context, c *client.Client, rl *ratelimit.Limiter, path s
 			return raw, nil
 		case "running":
 			lastStatus = "running"
+			if try == 0 {
+				firstID = meta.Meta.RequestID
+			} else if meta.Meta.RequestID != firstID {
+				sameID = false
+			}
 			select {
 			case <-time.After(paRunningDelay):
 			case <-ctx.Done():
@@ -667,11 +753,14 @@ type paStats struct {
 }
 
 type paPagerOpts struct {
-	From, To int64 // epoch ms, To exclusive
-	Desc     bool
-	PageSize int
-	MaxRows  int // 0 = unlimited
-	Fetch    func(ctx context.Context, from, to int64) (paPage, error)
+	From, To  int64 // epoch ms, To exclusive
+	Desc      bool
+	PageSize  int
+	MaxRows   int  // 0 = unlimited
+	CacheBust bool // only shapes the out-of-window hint
+	// Fetch pulls one page of at most limit rows (limit <= PageSize; smaller
+	// when fewer rows than a page are still wanted under MaxRows).
+	Fetch    func(ctx context.Context, from, to int64, limit int) (paPage, error)
 	Emit     func(rec map[string]any) error
 	Progress func(paStats)
 }
@@ -703,7 +792,19 @@ func paPaginate(ctx context.Context, o paPagerOpts) (paStats, error) {
 	var boundary int64 = -1 // start (ms) of the boundary second, -1 = none
 	var seen map[string]int // already-emitted records inside that second
 	for from < to {
-		page, err := o.Fetch(ctx, from, to)
+		limit := o.PageSize
+		if o.MaxRows > 0 {
+			// Ask only for what can still be emitted, plus the boundary repeats
+			// that will be dropped.
+			want := o.MaxRows - st.Rows
+			for _, n := range seen {
+				want += n
+			}
+			// +1: a full page then proves at least one row beyond the cap exists
+			// (so Truncated is exact), a short page proves the data ended.
+			limit = max(1, min(o.PageSize, want+1))
+		}
+		page, err := o.Fetch(ctx, from, to, limit)
 		if err != nil {
 			return st, err
 		}
@@ -727,7 +828,7 @@ func paPaginate(ctx context.Context, o paPagerOpts) (paStats, error) {
 				return st, err
 			}
 			if ts < from || ts >= to {
-				return st, fmt.Errorf("response row timestamp %d is outside the requested window [%d,%d) - the API returned data for a different window (stale cache?); retry with --cache-bust", ts, from, to)
+				return st, fmt.Errorf("response row timestamp %d is outside the requested window [%d,%d) - the API returned data for a different window%s", ts, from, to, paWindowHint(o.CacheBust))
 			}
 			tss[i] = ts
 			minTs, maxTs = min(minTs, ts), max(maxTs, ts)
@@ -762,10 +863,10 @@ func paPaginate(ctx context.Context, o paPagerOpts) (paStats, error) {
 		}
 		if o.MaxRows > 0 && st.Rows >= o.MaxRows {
 			// Cap reached exactly on a page edge: more exists iff the page was full.
-			st.Truncated = len(recs) >= o.PageSize
+			st.Truncated = len(recs) >= limit
 			return st, nil
 		}
-		if len(recs) < o.PageSize {
+		if len(recs) < limit {
 			return st, nil
 		}
 
@@ -791,6 +892,14 @@ func paPaginate(ctx context.Context, o paPagerOpts) (paStats, error) {
 		}
 	}
 	return st, nil
+}
+
+// paWindowHint tells the user what to try; --cache-bust is already the default.
+func paWindowHint(cacheBust bool) string {
+	if cacheBust {
+		return " (--cache-bust is already on, so this is not the usual stale response cache; re-run, and report it if it persists)"
+	}
+	return " (stale cache?); retry with --cache-bust"
 }
 
 func paNoProgress(n int, ts int64) error {
@@ -846,9 +955,9 @@ type paRowWriter interface {
 func paNewRowWriter(format string, w io.Writer, columns []string) (paRowWriter, error) {
 	switch format {
 	case "json":
-		return &paJSONWriter{w: w}, nil
+		return &paJSONWriter{w: bufio.NewWriterSize(w, paWriteBuf)}, nil
 	case "jsonl":
-		return &paJSONLWriter{w: w}, nil
+		return &paJSONLWriter{w: bufio.NewWriterSize(w, paWriteBuf)}, nil
 	case "csv":
 		cw := csv.NewWriter(w)
 		header := []string{}
@@ -867,10 +976,14 @@ func paNewRowWriter(format string, w io.Writer, columns []string) (paRowWriter, 
 	return nil, fmt.Errorf("unknown format %q", format)
 }
 
+// paWriteBuf is the json/jsonl write buffer (flushed per page and on Close, so
+// pipes still see rows page by page instead of one syscall per row).
+const paWriteBuf = 64 << 10
+
 // paJSONWriter streams a valid JSON array (closed even after a mid-stream
 // error so the file still parses; the non-zero exit code flags it incomplete).
 type paJSONWriter struct {
-	w     io.Writer
+	w     *bufio.Writer
 	began bool
 }
 
@@ -887,19 +1000,22 @@ func (j *paJSONWriter) Write(rec map[string]any) error {
 	return err
 }
 
-func (j *paJSONWriter) Flush() error { return nil }
+func (j *paJSONWriter) Flush() error { return j.w.Flush() }
 
 func (j *paJSONWriter) Close() error {
 	var err error
 	if !j.began {
-		_, err = io.WriteString(j.w, "[]\n")
+		_, err = j.w.WriteString("[]\n")
 	} else {
-		_, err = io.WriteString(j.w, "\n]\n")
+		_, err = j.w.WriteString("\n]\n")
+	}
+	if ferr := j.w.Flush(); err == nil {
+		err = ferr
 	}
 	return err
 }
 
-type paJSONLWriter struct{ w io.Writer }
+type paJSONLWriter struct{ w *bufio.Writer }
 
 func (j *paJSONLWriter) Write(rec map[string]any) error {
 	b, err := json.Marshal(rec)
@@ -909,8 +1025,8 @@ func (j *paJSONLWriter) Write(rec map[string]any) error {
 	_, err = fmt.Fprintf(j.w, "%s\n", b)
 	return err
 }
-func (j *paJSONLWriter) Flush() error { return nil }
-func (j *paJSONLWriter) Close() error { return nil }
+func (j *paJSONLWriter) Flush() error { return j.w.Flush() }
+func (j *paJSONLWriter) Close() error { return j.w.Flush() }
 
 type paCSVWriter struct {
 	w      *csv.Writer
@@ -1064,7 +1180,9 @@ func paUnwrapGroup(v json.RawMessage, group bool) any {
 }
 
 // paTimeseriesRows flattens {times:[ms..], series:[{group_tags:["facet:val"]}], values:[[..],..]}.
-func paTimeseriesRows(raw json.RawMessage) ([]map[string]any, error) {
+// Buckets starting at or after toMs (the API appends one trailing, always-null
+// bucket at --to) are dropped; toMs <= 0 keeps everything.
+func paTimeseriesRows(raw json.RawMessage, toMs int64) ([]map[string]any, error) {
 	var resp struct {
 		Data struct {
 			Attributes struct {
@@ -1089,6 +1207,9 @@ func paTimeseriesRows(raw json.RawMessage) ([]map[string]any, error) {
 			return nil, fmt.Errorf("pa timeseries response: series %d has %d values for %d times", si, len(a.Values[si]), len(a.Times))
 		}
 		for ti, t := range a.Times {
+			if toMs > 0 && t >= toMs {
+				continue
+			}
 			row := map[string]any{
 				"time":    time.UnixMilli(t).UTC().Format(time.RFC3339),
 				"time_ms": t,

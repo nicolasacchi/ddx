@@ -15,6 +15,10 @@ func lockFile(path string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	// O_CREATE's 0600 only applies to new files: tighten an existing one we own.
+	if fi, serr := f.Stat(); serr == nil && ownedByUs(fi) && fi.Mode().Perm() != 0o600 {
+		_ = f.Chmod(0o600)
+	}
 	for {
 		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
 		if err != syscall.EINTR {
@@ -29,4 +33,10 @@ func lockFile(path string) (func(), error) {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 	}, nil
+}
+
+// ownedByUs reports whether fi belongs to the current user.
+func ownedByUs(fi os.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return !ok || int(st.Uid) == os.Getuid()
 }
