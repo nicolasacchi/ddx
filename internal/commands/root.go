@@ -46,6 +46,15 @@ func SetVersion(v string) {
 	rootCmd.Version = v
 }
 
+// StreamedError wraps an error that happened after data was already streamed
+// to stdout (e.g. 'pa list' mid-way). main must report it on stderr only: a
+// JSON error envelope on stdout would corrupt the already-valid json/jsonl/csv
+// stream. Unwrap keeps the underlying error (and its exit code) reachable.
+type StreamedError struct{ Err error }
+
+func (e *StreamedError) Error() string { return e.Err.Error() }
+func (e *StreamedError) Unwrap() error { return e.Err }
+
 func Execute() error {
 	return rootCmd.Execute()
 }

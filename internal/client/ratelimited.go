@@ -36,6 +36,11 @@ func snippet(b []byte) string {
 // SetRetryNotify registers a callback for retry waits longer than 2s.
 func (c *Client) SetRetryNotify(f func(d time.Duration, why string)) { c.retryNotify = f }
 
+// RateLimitScope identifies the server-side rate-limit domain of this client
+// (API base URL + app key: Datadog budgets are per user). It contains the app
+// key, so only ever hash it (ratelimit.PABucketFor), never print or store it.
+func (c *Client) RateLimitScope() string { return c.baseURL + "\x00" + c.appKey }
+
 // SetBaseURL overrides the API base URL (used by tests to target httptest servers).
 func (c *Client) SetBaseURL(u string) { c.baseURL = u }
 

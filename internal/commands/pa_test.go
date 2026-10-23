@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -251,14 +253,19 @@ func eventKeys(ev []fakeEvent) []string {
 	return out
 }
 
+// fetchLimits records the per-page limits requested by the last runPaginate.
+var fetchLimits []int
+
 func runPaginate(t *testing.T, f *fakePA, desc bool, pageSize, maxRows int, from, to int64) ([]fakeEvent, paStats, error) {
 	t.Helper()
 	c, rl := paTestEnv(t, f)
 	var got []fakeEvent
+	fetchLimits = nil
 	st, err := paPaginate(context.Background(), paPagerOpts{
 		From: from, To: to, Desc: desc, PageSize: pageSize, MaxRows: maxRows,
-		Fetch: func(ctx context.Context, fr, tt int64) (paPage, error) {
-			return paFetchList(ctx, c, rl, paListSpec{DataSource: "product_analytics", Query: "*", Columns: []string{"@action.name"}, Limit: pageSize, Desc: desc, From: fr, To: tt})
+		Fetch: func(ctx context.Context, fr, tt int64, limit int) (paPage, error) {
+			fetchLimits = append(fetchLimits, limit)
+			return paFetchList(ctx, c, rl, paListSpec{DataSource: "product_analytics", Query: "*", Columns: []string{"@action.name"}, Limit: limit, Desc: desc, From: fr, To: tt})
 		},
 		Emit: func(r map[string]any) error {
 			ts, _ := paTimestamp(r)
@@ -338,7 +345,7 @@ func TestPaPaginateWindowAdvanceUsesBoundarySecond(t *testing.T) {
 func TestPaPaginateRejectsOutOfWindowRows(t *testing.T) {
 	_, err := paPaginate(context.Background(), paPagerOpts{
 		From: 10000, To: 20000, Desc: true, PageSize: 5,
-		Fetch: func(ctx context.Context, f, t int64) (paPage, error) {
+		Fetch: func(ctx context.Context, f, t int64, limit int) (paPage, error) {
 			return paPage{Records: []map[string]any{{"timestamp": json.Number("25000")}}, Total: 1}, nil
 		},
 		Emit: func(map[string]any) error { return nil },
@@ -362,7 +369,7 @@ func TestPaCacheBust(t *testing.T) {
 		var got []fakeEvent
 		_, err := paPaginate(context.Background(), paPagerOpts{
 			From: paT0, To: paT0 + 30000, Desc: true, PageSize: 10,
-			Fetch: func(ctx context.Context, fr, tt int64) (paPage, error) {
+			Fetch: func(ctx context.Context, fr, tt int64, limit int) (paPage, error) {
 				return paFetchList(ctx, c, rl, paListSpec{DataSource: "product_analytics", Query: "@type:action", Columns: []string{"@action.name"}, Limit: 10, Desc: true, From: fr, To: tt, Bust: bust})
 			},
 			Emit: func(r map[string]any) error {
@@ -510,7 +517,7 @@ func TestPaTimeseriesRows(t *testing.T) {
 		"times":[1792720800000,1792724400000],
 		"series":[{"group_tags":["@type:action"],"query_index":0},{"group_tags":["@type:view"],"query_index":0}],
 		"values":[[254,null],[7,8]]}}}`)
-	rows, err := paTimeseriesRows(raw)
+	rows, err := paTimeseriesRows(raw, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,7 +533,7 @@ func TestPaTimeseriesRows(t *testing.T) {
 	}
 	// ungrouped
 	raw = json.RawMessage(`{"data":{"attributes":{"times":[1],"series":[{"group_tags":[]}],"values":[[5]]}}}`)
-	if rows, err = paTimeseriesRows(raw); err != nil || len(rows) != 1 || rows[0]["value"] == nil {
+	if rows, err = paTimeseriesRows(raw, 0); err != nil || len(rows) != 1 || rows[0]["value"] == nil {
 		t.Fatalf("ungrouped rows=%v err=%v", rows, err)
 	}
 }
@@ -602,5 +609,272 @@ func TestPaCSVWriterDedupesColumnsAndFlushes(t *testing.T) {
 	}
 	if got := buf.String(); got != "@a,timestamp\nx,5\n" {
 		t.Fatalf("after Flush: %q", got)
+	}
+}
+
+func TestPaStreamedErrorKeepsExitCodeAndWrapsUnderlying(t *testing.T) {
+	inner := &client.APIError{Kind: "async_timeout", Detail: "x"}
+	var err error = &StreamedError{Err: inner}
+	var ae *client.APIError
+	if !errors.As(err, &ae) || ae.ExitCode() != 7 {
+		t.Fatalf("StreamedError must unwrap to the APIError (exit 7), got %v", err)
+	}
+	var se *StreamedError
+	if !errors.As(fmt.Errorf("wrapped: %w", err), &se) {
+		t.Fatal("main must be able to detect StreamedError")
+	}
+}
+
+func TestPaMidStreamFailureLeavesValidStdoutDocuments(t *testing.T) {
+	// Page 1 succeeds (full page -> keep going), page 2 fails: the writers must
+	// still close into a valid document.
+	for _, format := range []string{"json", "jsonl", "csv"} {
+		var buf bytes.Buffer
+		w, err := paNewRowWriter(format, &buf, []string{"a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		_, perr := paPaginate(context.Background(), paPagerOpts{
+			From: 10000, To: 20000, Desc: false, PageSize: 2,
+			Fetch: func(ctx context.Context, f, to int64, limit int) (paPage, error) {
+				calls++
+				if calls == 2 {
+					return paPage{}, errors.New("boom")
+				}
+				return paPage{Records: []map[string]any{
+					{"a": "x", "timestamp": json.Number("11000")}, {"a": "y", "timestamp": json.Number("12000")}}, Total: 9}, nil
+			},
+			Emit:     w.Write,
+			Progress: func(paStats) { w.Flush() },
+		})
+		if perr == nil {
+			t.Fatal("want error")
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		switch format {
+		case "json":
+			var arr []map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &arr); err != nil || len(arr) != 2 {
+				t.Fatalf("json invalid: %v %q", err, buf.String())
+			}
+		case "jsonl":
+			if strings.Count(buf.String(), "\n") != 2 {
+				t.Fatalf("jsonl = %q", buf.String())
+			}
+		case "csv":
+			if buf.String() != "a,timestamp\nx,11000\ny,12000\n" {
+				t.Fatalf("csv = %q", buf.String())
+			}
+		}
+	}
+}
+
+func TestPaWriterBuffersUntilFlush(t *testing.T) {
+	var buf bytes.Buffer
+	w, _ := paNewRowWriter("jsonl", &buf, nil)
+	_ = w.Write(map[string]any{"a": 1})
+	if buf.Len() != 0 {
+		t.Fatalf("row written before Flush (%q): per-row unbuffered writes are back", buf.String())
+	}
+	_ = w.Flush()
+	if buf.String() != "{\"a\":1}\n" {
+		t.Fatalf("after Flush = %q", buf.String())
+	}
+}
+
+func TestPaGroupLimitNotes(t *testing.T) {
+	rows := []map[string]any{}
+	for i := 0; i < 3; i++ {
+		rows = append(rows, map[string]any{"@x": fmt.Sprintf("v%d", i), "@y": "same", "value": i})
+	}
+	notes := paGroupLimitNotes(rows, []paGroup{{"@x", 3}, {"@y", 20}, {"@z", 1}})
+	if len(notes) != 1 || !strings.Contains(notes[0], "group @x hit its limit (3)") || !strings.Contains(notes[0], "@x:N") {
+		t.Fatalf("notes = %q", notes)
+	}
+	if n := paGroupLimitNotes(rows, []paGroup{{"@x", 4}}); len(n) != 0 {
+		t.Fatalf("below limit must not warn: %q", n)
+	}
+}
+
+func TestPaTimeseriesDropsBucketsAtOrAfterTo(t *testing.T) {
+	raw := json.RawMessage(`{"data":{"attributes":{"times":[1000,2000,3000],"series":[{"group_tags":[]}],"values":[[1,2,null]]}}}`)
+	rows, err := paTimeseriesRows(raw, 3000)
+	if err != nil || len(rows) != 2 || rows[1]["time_ms"] != int64(2000) {
+		t.Fatalf("rows=%v err=%v", rows, err)
+	}
+	if rows, _ = paTimeseriesRows(raw, 2500); len(rows) != 2 {
+		t.Fatalf("bucket 3000 >= to must go, rows=%v", rows)
+	}
+}
+
+func TestPaResolveInterval(t *testing.T) {
+	t.Setenv("DDX_PA_MIN_INTERVAL", "3s")
+	if d, err := paResolveInterval(false, 0); err != nil || d != 3*time.Second {
+		t.Fatalf("env fallback = %v, %v", d, err)
+	}
+	if d, err := paResolveInterval(true, 0); err != nil || d != 0 {
+		t.Fatalf("explicit --min-interval 0 must disable spacing even with env set, got %v, %v", d, err)
+	}
+	if d, _ := paResolveInterval(true, 500*time.Millisecond); d != 500*time.Millisecond {
+		t.Fatalf("flag = %v", d)
+	}
+	if _, err := paResolveInterval(true, -time.Second); err == nil {
+		t.Fatal("negative must be rejected")
+	}
+	t.Setenv("DDX_PA_MIN_INTERVAL", "")
+	if d, _ := paResolveInterval(false, 0); d != time.Second {
+		t.Fatalf("default = %v", d)
+	}
+}
+
+func TestPaWindowHintDependsOnCacheBust(t *testing.T) {
+	run := func(bust bool) error {
+		_, err := paPaginate(context.Background(), paPagerOpts{
+			From: 10000, To: 20000, Desc: true, PageSize: 5, CacheBust: bust,
+			Fetch: func(ctx context.Context, f, t int64, limit int) (paPage, error) {
+				return paPage{Records: []map[string]any{{"timestamp": json.Number("25000")}}, Total: 1}, nil
+			},
+			Emit: func(map[string]any) error { return nil },
+		})
+		return err
+	}
+	if err := run(true); err == nil || strings.Contains(err.Error(), "retry with --cache-bust") || !strings.Contains(err.Error(), "already on") {
+		t.Fatalf("bust on: %v", err)
+	}
+	if err := run(false); err == nil || !strings.Contains(err.Error(), "retry with --cache-bust") {
+		t.Fatalf("bust off: %v", err)
+	}
+}
+
+func TestPaEmptyQueryAndGroupLimitWhitespace(t *testing.T) {
+	if got := paBustQuery("  ", "n1"); got != "(*) -@ddx_nonce:n1" {
+		t.Fatalf("empty query bust = %q", got)
+	}
+	if got := paBustQuery("", ""); got != "*" {
+		t.Fatalf("empty query = %q", got)
+	}
+	g, err := paParseGroupBys([]string{"@view.name: 50", " @type "})
+	if err != nil || !reflect.DeepEqual(g, []paGroup{{"@view.name", 50}, {"@type", 20}}) {
+		t.Fatalf("groups = %v err=%v", g, err)
+	}
+}
+
+func TestPaPostReusesBodyAcrossRunningRepolls(t *testing.T) {
+	old := paRunningDelay
+	paRunningDelay = time.Millisecond
+	defer func() { paRunningDelay = old }()
+	oldN := paNonce
+	n := 0
+	paNonce = func() string { n++; return fmt.Sprintf("n%d", n) }
+	defer func() { paNonce = oldN }()
+
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		status := "running"
+		if len(bodies) >= 3 {
+			status = "done"
+		}
+		fmt.Fprintf(w, `{"data":{},"meta":{"status":%q}}`, status)
+	}))
+	defer srv.Close()
+	c := client.New("k", "a", "datadoghq.eu", false)
+	c.SetBaseURL(srv.URL)
+	rl := &ratelimit.Limiter{Bucket: "s", Dir: t.TempDir()}
+	_, err := paPost(context.Background(), c, rl, "x", func() any {
+		return paAnalyticsBody("product_analytics", "*", true, "count", "", nil, 0, 1, 2)
+	})
+	if err != nil || len(bodies) != 3 || bodies[0] != bodies[1] || bodies[1] != bodies[2] || n != 1 {
+		t.Fatalf("err=%v bodies=%d nonces=%d: re-polls must resend the identical body", err, len(bodies), n)
+	}
+}
+
+func TestPaPaginateRequestsOnlyWhatMaxRowsNeeds(t *testing.T) {
+	f := &fakePA{events: tiedEvents()}
+	got, st, err := runPaginate(t, f, true, 10, 4, paT0-5000, paT0+50000)
+	if err != nil || len(got) != 4 || !st.Truncated {
+		t.Fatalf("rows=%d st=%+v err=%v", len(got), st, err)
+	}
+	if len(fetchLimits) != 1 || fetchLimits[0] != 5 {
+		t.Fatalf("limits = %v, want [5] (min(page-size, remaining+1))", fetchLimits)
+	}
+	// Multi-page under a cap that is not a page multiple: every row exactly once,
+	// no spurious no-progress error from the smaller final limit.
+	for _, desc := range []bool{true, false} {
+		for _, max := range []int{5, 7, 11, 13} {
+			f := &fakePA{events: tiedEvents()}
+			got, _, err := runPaginate(t, f, desc, 4, max, paT0-5000, paT0+50000)
+			if err != nil || len(got) != max {
+				t.Fatalf("desc=%v max=%d: rows=%d err=%v limits=%v", desc, max, len(got), err, fetchLimits)
+			}
+			for _, l := range fetchLimits {
+				if l > 4 || l < 1 {
+					t.Fatalf("limit %d out of range", l)
+				}
+			}
+		}
+	}
+}
+
+func TestPaPostFinalRepollGetsFreshNonceWhenRequestIDStuck(t *testing.T) {
+	old := paRunningDelay
+	paRunningDelay = time.Millisecond
+	defer func() { paRunningDelay = old }()
+	oldN := paNonce
+	n := 0
+	paNonce = func() string { n++; return fmt.Sprintf("n%d", n) }
+	defer func() { paNonce = oldN }()
+
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		fmt.Fprint(w, `{"data":{},"meta":{"status":"running","request_id":"same"}}`)
+	}))
+	defer srv.Close()
+	c := client.New("k", "a", "datadoghq.eu", false)
+	c.SetBaseURL(srv.URL)
+	rl := &ratelimit.Limiter{Bucket: "s", Dir: t.TempDir()}
+	_, err := paPost(context.Background(), c, rl, "x", func() any {
+		return paAnalyticsBody("product_analytics", "*", true, "count", "", nil, 0, 1, 2)
+	})
+	if err == nil || len(bodies) != paRunningRetries+1 || n != 2 {
+		t.Fatalf("err=%v bodies=%d nonces=%d, want a fresh nonce only for the last attempt", err, len(bodies), n)
+	}
+	if bodies[0] != bodies[paRunningRetries-1] || bodies[paRunningRetries-1] == bodies[paRunningRetries] {
+		t.Fatal("re-polls must share the body; the final attempt must differ")
+	}
+}
+
+func TestPaGroupLimitNotesNestedIsPerParent(t *testing.T) {
+	rows := []map[string]any{
+		{"@a": "x", "@b": "b1"}, {"@a": "y", "@b": "b2"},
+	}
+	if n := paGroupLimitNotes(rows, []paGroup{{"@a", 5}, {"@b", 2}}); len(n) != 0 {
+		t.Fatalf("no parent has 2 children, got %q", n)
+	}
+	rows = append(rows, map[string]any{"@a": "x", "@b": "b3"})
+	if n := paGroupLimitNotes(rows, []paGroup{{"@a", 5}, {"@b", 2}}); len(n) != 1 {
+		t.Fatalf("parent x has 2 children, want a note, got %q", n)
+	}
+}
+
+func TestPaPaginateExactlyMaxRowsIsNotTruncated(t *testing.T) {
+	for _, desc := range []bool{true, false} {
+		f := &fakePA{events: tiedEvents()}
+		total := len(f.events)
+		got, st, err := runPaginate(t, f, desc, 1000, total, paT0-5000, paT0+50000)
+		if err != nil || len(got) != total || st.Truncated {
+			t.Fatalf("desc=%v rows=%d/%d truncated=%v err=%v", desc, len(got), total, st.Truncated, err)
+		}
+		f = &fakePA{events: tiedEvents()}
+		got, st, err = runPaginate(t, f, desc, 1000, total-1, paT0-5000, paT0+50000)
+		if err != nil || len(got) != total-1 || !st.Truncated {
+			t.Fatalf("desc=%v cap-1: rows=%d truncated=%v err=%v", desc, len(got), st.Truncated, err)
+		}
 	}
 }
