@@ -25,6 +25,7 @@ func TestCrossInstanceSpacing(t *testing.T) {
 
 	var mu sync.Mutex
 	var stamps []time.Time
+	t0 := time.Now()
 	var wg sync.WaitGroup
 	for _, l := range []*Limiter{a, b} {
 		for g := 0; g < 2; g++ {
@@ -49,16 +50,22 @@ func TestCrossInstanceSpacing(t *testing.T) {
 		t.Fatalf("got %d stamps, want 12", len(stamps))
 	}
 	sort.Slice(stamps, func(i, j int) bool { return stamps[i].Before(stamps[j]) })
-	for i := 1; i < len(stamps); i++ {
-		// tolerance for timer/scheduling skew (stamps are taken after Wait, under -race load)
-		if gap := stamps[i].Sub(stamps[i-1]); gap < interval-40*time.Millisecond {
-			t.Fatalf("gap %d = %s, want >= ~%s", i, gap, interval)
+	// Stamps are taken after Wait returns, so a descheduled goroutine can stamp
+	// late and compress the gap to its neighbour: pairwise gaps are NOT a valid
+	// invariant under load. What is guaranteed is that Wait never returns before
+	// its slot, and the slots are distinct multiples of interval starting no
+	// earlier than t0. Hence the k-th earliest stamp is >= t0 + k*interval
+	// (each stamp dominates its slot), independent of scheduling delays.
+	for k, st := range stamps {
+		if floor := t0.Add(time.Duration(k) * interval); st.Before(floor.Add(-clockSlack)) {
+			t.Fatalf("stamp %d at +%s, want >= +%s", k, st.Sub(t0), floor.Sub(t0))
 		}
 	}
-	if total := stamps[len(stamps)-1].Sub(stamps[0]); total < 11*interval-30*time.Millisecond {
-		t.Fatalf("12 slots took %s, want >= ~%s", total, 11*interval)
-	}
 }
+
+// clockSlack absorbs wall-vs-monotonic clock rounding only; it is not a
+// scheduling tolerance.
+const clockSlack = 2 * time.Millisecond
 
 func fakeLimiter(dir string, now *time.Time, slept *[]time.Duration) *Limiter {
 	return &Limiter{
@@ -242,6 +249,7 @@ func TestCrossProcessSpacing(t *testing.T) {
 	}
 	dir := t.TempDir()
 	const interval = 100 * time.Millisecond
+	t0 := time.Now().UnixNano()
 	type out struct {
 		b   []byte
 		err error
@@ -271,9 +279,11 @@ func TestCrossProcessSpacing(t *testing.T) {
 		t.Fatalf("got %d stamps, want 12", len(stamps))
 	}
 	sort.Slice(stamps, func(i, j int) bool { return stamps[i] < stamps[j] })
-	for i := 1; i < len(stamps); i++ {
-		if gap := time.Duration(stamps[i] - stamps[i-1]); gap < interval-20*time.Millisecond {
-			t.Fatalf("gap %d = %s, want >= ~%s", i, gap, interval)
+	// Same invariant as TestCrossInstanceSpacing: the k-th earliest stamp is
+	// >= t0 + k*interval, whatever the scheduling delay between Wait and stamp.
+	for k, st := range stamps {
+		if floor := t0 + int64(k)*int64(interval); st < floor-int64(clockSlack) {
+			t.Fatalf("stamp %d at +%s, want >= +%s", k, time.Duration(st-t0), time.Duration(floor-t0))
 		}
 	}
 }
