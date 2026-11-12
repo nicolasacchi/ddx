@@ -4,17 +4,15 @@ CLI for the [Datadog](https://www.datadoghq.com/) API. 35 command groups coverin
 
 ## Install
 
-```bash
-go install github.com/nicolasacchi/ddx/cmd/ddx@latest
-```
-
-Or build from source:
+Build from source (stamps the version into the binary; needs Go 1.27+):
 
 ```bash
 git clone https://github.com/nicolasacchi/ddx.git
 cd ddx
-make install
+make install   # → ~/go/bin/ddx, `ddx --version` prints the git tag
 ```
+
+`go install github.com/nicolasacchi/ddx/cmd/ddx@latest` also works but reports version `dev`.
 
 ## Quick Start
 
@@ -465,6 +463,8 @@ ddx cloud aws
 ddx cloud gcp
 ddx cloud azure
 ```
+
+`aws`/`gcp` use the v2 `integration/{aws,gcp}/accounts` endpoints and fall back to the deprecated v1 integration endpoints on 404. `azure` uses `GET api/v1/integration/azure` (no v2 list endpoint exists).
 
 ### `cost` — Cloud Cost Management
 
