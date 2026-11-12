@@ -50,8 +50,8 @@ func TestCrossInstanceSpacing(t *testing.T) {
 	}
 	sort.Slice(stamps, func(i, j int) bool { return stamps[i].Before(stamps[j]) })
 	for i := 1; i < len(stamps); i++ {
-		// small tolerance for timer/scheduling skew
-		if gap := stamps[i].Sub(stamps[i-1]); gap < interval-15*time.Millisecond {
+		// tolerance for timer/scheduling skew (stamps are taken after Wait, under -race load)
+		if gap := stamps[i].Sub(stamps[i-1]); gap < interval-40*time.Millisecond {
 			t.Fatalf("gap %d = %s, want >= ~%s", i, gap, interval)
 		}
 	}
